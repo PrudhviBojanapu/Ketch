@@ -38,15 +38,15 @@ object KetchFeatures {
    */
   const val AWAIT_FILE_SELECTION: String = "download.awaitFileSelection"
 
-  /** [KetchApi.torrents] executes commands: REST `/api/torrents` and its event stream. */
-  const val TORRENT_CONTROL: String = "torrent.control"
-
   /** [KetchApi.activeConnections] reports live connections. */
   const val ACTIVE_CONNECTIONS: String = "net.activeConnections"
 
-  /** Every feature this version of Ketch supports, including optional sources. */
+  /**
+   * Every feature named here, which this version of Ketch supports, including those of its
+   * optional sources. Modules beside this one name the features of their own controllers.
+   */
   val ALL: Set<String> = setOf(
     AUTO_CONNECTIONS, QUEUE_POSITION, REQUEST_ID, PROXY, FINITE_MEDIA, FINITE_HLS, FINITE_DASH,
-    CATEGORY_FOLDERS, FILE_SELECTION, AWAIT_FILE_SELECTION, TORRENT_CONTROL, ACTIVE_CONNECTIONS
+    CATEGORY_FOLDERS, FILE_SELECTION, AWAIT_FILE_SELECTION, ACTIVE_CONNECTIONS
   )
 }

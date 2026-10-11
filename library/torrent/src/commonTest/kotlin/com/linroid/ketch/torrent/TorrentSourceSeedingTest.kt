@@ -5,8 +5,8 @@ import com.linroid.ketch.api.ResolvedSource
 import com.linroid.ketch.api.ConnectionDirection
 import com.linroid.ketch.core.engine.ConnectionReporter
 import com.linroid.ketch.core.engine.DownloadContext
-import com.linroid.ketch.core.engine.SeedingOutcome
-import com.linroid.ketch.core.engine.SeedingTask
+import com.linroid.ketch.torrent.control.SeedingOutcome
+import com.linroid.ketch.torrent.control.SeedingTask
 import com.linroid.ketch.core.engine.SourceResumeState
 import com.linroid.ketch.core.file.FileAccessor
 import kotlinx.coroutines.CoroutineScope
