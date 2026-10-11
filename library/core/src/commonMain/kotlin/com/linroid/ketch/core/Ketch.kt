@@ -1,5 +1,6 @@
 package com.linroid.ketch.core
 
+import com.linroid.ketch.api.ActiveConnections
 import com.linroid.ketch.api.Destination
 import com.linroid.ketch.api.DownloadCondition
 import com.linroid.ketch.api.DownloadConfig
@@ -32,6 +33,7 @@ import com.linroid.ketch.api.torrent.TorrentCommandException
 import com.linroid.ketch.api.torrent.TorrentController
 import com.linroid.ketch.api.torrent.TorrentRevision
 import com.linroid.ketch.core.engine.ConfigurableNetworkHttpEngine
+import com.linroid.ketch.core.engine.ConnectionRegistry
 import com.linroid.ketch.core.engine.DelegatingSpeedLimiter
 import com.linroid.ketch.core.engine.DownloadCoordinator
 import com.linroid.ketch.core.engine.DownloadQueue
@@ -73,6 +75,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -154,6 +157,7 @@ class Ketch(
     add(KetchFeatures.REQUEST_ID)
     if (httpEngine.supportsProxies) add(KetchFeatures.PROXY)
     add(KetchFeatures.CATEGORY_FOLDERS)
+    add(KetchFeatures.ACTIVE_CONNECTIONS)
     additionalSources.forEach { addAll(it.features) }
     if (KetchFeatures.FINITE_HLS in this && KetchFeatures.FINITE_DASH in this) {
       add(KetchFeatures.FINITE_MEDIA)
@@ -167,12 +171,16 @@ class Ketch(
   /** Scope for task coordination (scheduling, queue, state). */
   private val scope = CoroutineScope(SupervisorJob() + dispatchers.main.limitedParallelism(1))
 
+  /** Live connections of every task, sampled on [scope] while observed. */
+  private val connectionRegistry = ConnectionRegistry(scope)
+
   private val coordinator = DownloadCoordinator(
     sourceResolver = sourceResolver,
     config = { currentConfig },
     fileNameResolver = fileNameResolver,
     globalLimiter = globalLimiter,
     dispatchers = dispatchers,
+    connections = connectionRegistry::reporter,
   )
 
   private val queue = DownloadQueue(
@@ -416,7 +424,7 @@ class Ketch(
     val outcome = try {
       control.startSeeding(
         SeedingTask(taskId, record.request.url, resumeState, outputPath,
-          record.request.selectedFileIds)
+          record.request.selectedFileIds, connectionRegistry.reporter(taskId))
       )
     } catch (e: CancellationException) {
       throw e
@@ -517,6 +525,7 @@ class Ketch(
           log.w(e) { "Cleanup failed for taskId=$taskId" }
         }
       }
+      connectionRegistry.closeTask(taskId)
       taskStore.remove(taskId)
       monitorMutex.withLock { taskMonitors.remove(taskId)?.cancel() }
       tasksMutex.withLock {
@@ -1085,9 +1094,17 @@ class Ketch(
     return configurable.updateNetworkInterfaces(config)
   }
 
+  /**
+   * Live connections of every task, sampled once a second while collected. Reports HTTP and
+   * media requests, FTP transfers and the peers of sources that report them.
+   */
+  override fun activeConnections(limit: Int): Flow<ActiveConnections> =
+    connectionRegistry.snapshots(limit)
+
   override fun close() {
     log.i { "Closing Ketch" }
     coordinator.close()
+    connectionRegistry.closeAll()
     scope.cancel()
     sourceResolver.close()
     httpEngine.close()
