@@ -483,9 +483,9 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   seed` and into free engine slots only, each after a recheck; a task whose files changed on disk
   loses the intent, one a download or shutdown stopped keeps it. `TorrentDownloadSource(...,
   restoreSeeding = false)`, as `ketch mcp --standalone` builds it, never restores
-- Port mapping, `TorrentConfig.portMapping` (on; engines get it through `KotlinTorrentEngine`'s
-  `portMapping` argument, which `TorrentDownloadSource` passes, so engines built directly in tests
-  never reach the router): `TorrentPortMapper` tries `NatPmpClient` (RFC 6886, to the
+- Port mapping, `TorrentConfig.portMapping` (on; only engines whose `KotlinTorrentEngine`
+  `portMapping` argument allows it, as `TorrentDownloadSource` always does, map ports, so engines
+  built directly in tests never reach the router): `TorrentPortMapper` tries `NatPmpClient` (RFC 6886, to the
   `LocalIpv4Network.gatewayGuesses` of `localIpv4Networks()`, an expect/actual over
   `NetworkInterface` and `getifaddrs`), then `UpnpClient` (SSDP, the device description and SOAP
   over a minimal HTTP/1.1 client on direct TCP; only devices on one of our private networks). TCP
@@ -664,7 +664,12 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   the four `TorrentConfig` sites) and `uploadLimit` (`TorrentConfig.uploadRateLimit`), both read
   leniently (a value of any type that cannot be read loads as off or unlimited, and a bare
   `uploadLimit` number is bytes per second), are applied live through
-  `TorrentDownloadSource.setUploadPolicy`/`setUploadRateLimit`
+  `TorrentDownloadSource.setUploadPolicy`/`setUploadRateLimit`. `encryption`
+  (`TorrentEncryptionMode`: `preferred`/`required`/`off`, unknown values load as `preferred`,
+  mapped to `TorrentEncryption` at the four sites), `utp` and `portMapping` (all on), edited
+  under Settings → BitTorrent → Connections, apply live through `setEncryption`,
+  `setUtpEnabled` and `setPortMapping` (the engine's `TorrentPeerEncryption.policy`, a uTP
+  endpoint that refuses new connections while off, and a port mapper started or stopped)
 - `SpeedSettings`: the embedded device's speed mode (Full speed, Slow lane, Auto with weekly
   `SpeedRule`s), applied by the apps' `SpeedModeController`; `UiPreferences` (`[ui]`): view
   state such as table columns, sort, sidebar, inspector, density, per-device add sheet defaults,

@@ -91,13 +91,17 @@ class TorrentDownloadSource(
   private val listedTrackers = AtomicReference(emptyList<String>())
   private val uploadPolicy = AtomicReference(config.effectiveUploadPolicy)
   private val uploadRateLimit = AtomicLong(config.uploadRateLimit)
+  private val encryption = AtomicReference(config.encryption)
+  private val utpEnabled = AtomicBoolean(config.utpEnabled)
+  private val portMapping = AtomicBoolean(config.portMapping)
 
   /** The upload policy of running and later torrents: the configured one or the last set. */
   internal val currentUploadPolicy: TorrentUploadPolicy get() = uploadPolicy.load()
 
   /** Creates the engine from [engineConfig], under [engineMutex]. */
   internal var engineFactory: (TorrentConfig) -> TorrentEngine = {
-    KotlinTorrentEngine(it, http = http, portMapping = it.portMapping)
+    // May map ports; TorrentConfig.portMapping, which setPortMapping changes, decides if it does.
+    KotlinTorrentEngine(it, http = http, portMapping = true)
   }
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val trackerListSubscription = TrackerLists(
@@ -242,7 +246,42 @@ class TorrentDownloadSource(
 
   /** The configuration of the next engine: the config with what the setters changed since. */
   private fun engineConfig(): TorrentConfig = config.copy(additionalTrackers = extraTrackers(),
-    uploadPolicy = uploadPolicy.load(), uploadRateLimit = uploadRateLimit.load())
+    uploadPolicy = uploadPolicy.load(), uploadRateLimit = uploadRateLimit.load(),
+    encryption = encryption.load(), utpEnabled = utpEnabled.load(),
+    portMapping = portMapping.load())
+
+  /**
+   * Replaces [TorrentConfig.encryption] for connections opened from now on; open ones keep
+   * theirs. Never starts the engine.
+   */
+  suspend fun setEncryption(value: TorrentEncryption) {
+    engineMutex.withLock {
+      encryption.store(value)
+      engine.load()?.setEncryption(value)
+    }
+  }
+
+  /**
+   * Replaces [TorrentConfig.utpEnabled] for connections opened from now on; open uTP connections
+   * keep running. Never starts the engine.
+   */
+  suspend fun setUtpEnabled(enabled: Boolean) {
+    engineMutex.withLock {
+      utpEnabled.store(enabled)
+      engine.load()?.setUtpEnabled(enabled)
+    }
+  }
+
+  /**
+   * Replaces [TorrentConfig.portMapping]: a running engine starts or stops asking the router to
+   * forward its listen port, removing the mapping it has. Never starts the engine.
+   */
+  suspend fun setPortMapping(enabled: Boolean) {
+    engineMutex.withLock {
+      portMapping.store(enabled)
+      engine.load()?.setPortMapping(enabled)
+    }
+  }
 
   /**
    * Replaces [TorrentConfig.uploadPolicy] at once: running torrents choke or unchoke their peers
