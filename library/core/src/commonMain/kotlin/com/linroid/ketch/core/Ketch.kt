@@ -468,6 +468,7 @@ class Ketch(
           updatedAt = Clock.System.now(),
         )
       }
+      command.afterSave()
       log.i { "Sharing intent of taskId=$taskId: $sharing" }
       ControlOutcome(generation, sharing, revision, replayed = false)
     }
@@ -532,12 +533,17 @@ class Ketch(
       }
     }
 
-    override suspend fun saveSharingIntent(task: DownloadTask, sharing: Boolean) {
+    override suspend fun saveSharingIntent(
+      task: DownloadTask,
+      sharing: Boolean,
+      onlyIf: () -> Boolean,
+    ) {
       val handle = handleOf(task) ?: return
       handle.controlLock.withLock {
         val record = handle.record.value
         if ((record.control?.sharing ?: false) == sharing) return@withLock
         if (sharing && record.state != TaskState.COMPLETED) return@withLock
+        if (!onlyIf()) return@withLock
         handle.record.update {
           it.copy(
             control = (it.control ?: TaskControl()).copy(sharing = sharing),
@@ -620,6 +626,7 @@ class Ketch(
           updatedAt = Clock.System.now(),
         )
       }
+      command.afterSave()
       return ControlOutcome(
         control.selectionGeneration, control.sharing, revision, replayed = false,
       )
@@ -656,6 +663,7 @@ class Ketch(
         updatedAt = now,
       )
     }
+    command?.afterSave()
     val delivery = if (running) {
       coordinator.deliverSelection(taskId, plan.fileIds, plan.totalBytes)
     } else {
