@@ -17,6 +17,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /** uTP endpoints over real loopback UDP ports. */
@@ -213,6 +214,36 @@ class UtpEndpointTest {
     val c = side(network, scope)
     fallback.connect(c.address).close()
     fallback.connect(c.address).close()
+    assertEquals(1, tcp)
+  }
+
+  @Test
+  fun fallback_fullEndpoint_keepsThePeerPreferred() = endpoints { network, scope ->
+    val b = side(network, scope)
+    val incoming = Channel<TorrentConnection>(Channel.UNLIMITED)
+    var endpoint: UtpEndpoint? = null
+    val port = TorrentUdpPort(network.bindUdp(PeerEndpoint("127.0.0.1", 0)), scope,
+      utp = { endpoint?.receive(it) })
+    // Room for one connection only.
+    endpoint = UtpEndpoint(scope, port::send, onIncoming = { incoming.trySend(it).isSuccess },
+      maxConnections = 1)
+    var tcp = 0
+    val refused = object : TorrentNetwork by network {
+      override suspend fun connect(remote: PeerEndpoint): TorrentConnection {
+        tcp++
+        throw IOException("Connection refused")
+      }
+    }
+    val fallback = TorrentUtpFallback(refused) { endpoint }
+    fallback.preferUtp(listOf(b.address))
+    val first = fallback.connect(b.address)
+    // Full: the second dial cannot use uTP and falls through to TCP, which is refused.
+    assertFailsWith<IOException> { fallback.connect(b.address) }
+    assertEquals(1, tcp)
+    first.close()
+    // Once there is room, the peer is still dialed over uTP first: no TCP connect this time.
+    withTimeout(5_000) { while (assertNotNull(endpoint).connectionCount > 0) delay(50) }
+    fallback.connect(b.address).close()
     assertEquals(1, tcp)
   }
 
