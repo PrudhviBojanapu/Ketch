@@ -12,11 +12,13 @@ import com.linroid.ketch.torrent.net.createTorrentNetwork
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.job
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -63,7 +65,8 @@ class UtpEndpointTest {
           try {
             coroutineScope { test(network, scope) }
           } finally {
-            scope.cancel()
+            // Stopped before its sockets close, which fails rather than cancels their I/O.
+            withContext(NonCancellable) { scope.coroutineContext.job.cancelAndJoin() }
             network.close()
           }
         }
