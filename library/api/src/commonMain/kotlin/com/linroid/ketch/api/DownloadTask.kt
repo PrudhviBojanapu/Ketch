@@ -117,6 +117,31 @@ interface DownloadTask {
   suspend fun setConnections(connections: Int)
 
   /**
+   * Changes which files or variants of a download with several ([ResolvedSource.files], such as a
+   * torrent's files) this task downloads, following its [ResolvedSource.selectionMode]: any
+   * subset for [FileSelectionMode.MULTIPLE], exactly one for [FileSelectionMode.SINGLE]. Saves
+   * the selection in [request] and its size as the task's total, then applies it: a running
+   * download changes course without reconnecting (newly chosen files are created and downloaded,
+   * unchosen ones stay on disk but stop downloading); queued, scheduled, paused and failed tasks
+   * use it when they start; a task paused for [PauseReason.AwaitingFileSelection] starts; a
+   * completed task whose selection gains files downloads them (Queued, Downloading, then
+   * Completed again) while removing files only changes its size. Re-selecting the current files
+   * does nothing.
+   *
+   * @param fileIds IDs from [ResolvedSource.files]: between 1 and [MAX_SELECTED_FILES] of them,
+   *   each 1 to [MAX_FILE_ID_LENGTH] characters long
+   * @throws IllegalArgumentException if [fileIds] is empty, has more than [MAX_SELECTED_FILES]
+   *   entries (more than one for a single choice), or names a file the download does not have
+   * @throws IllegalStateException if the file list is not known yet, the task was canceled, or a
+   *   file Ketch does not own exists where a newly chosen file would be saved
+   * @throws UnsupportedOperationException if the download has no files to choose or the backend
+   *   cannot change them (an older server; check [KetchFeatures.FILE_SELECTION])
+   */
+  suspend fun selectFiles(fileIds: Set<String>) {
+    throw UnsupportedOperationException("Changing the files of this download is unavailable")
+  }
+
+  /**
    * Reschedules this download with a new schedule and optional conditions.
    * Active downloads are paused (preserving progress) before rescheduling.
    * Works from any non-terminal state; calls in a [terminal][DownloadState.isTerminal]
@@ -158,6 +183,14 @@ interface DownloadTask {
       is DownloadState.Canceled -> Result.failure(KetchError.Canceled())
       else -> Result.failure(KetchError.Unknown(null))
     }
+  }
+
+  companion object {
+    /** The most files one [selectFiles] call may choose. */
+    const val MAX_SELECTED_FILES: Int = 100_000
+
+    /** The longest file ID [selectFiles] accepts. */
+    const val MAX_FILE_ID_LENGTH: Int = 128
   }
 }
 
