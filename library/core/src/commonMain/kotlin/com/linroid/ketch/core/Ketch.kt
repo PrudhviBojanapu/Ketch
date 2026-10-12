@@ -119,10 +119,11 @@ import kotlin.uuid.Uuid
  *   (e.g., FTP, media). HTTP is always included as a fallback. A source may contribute typed
  *   controllers and lifecycle hooks through [DownloadSource.attach].
  * @param logger logging backend
- * @param dispatchers dedicated dispatchers for task management,
- *   network operations, and file I/O. The default pools have a fixed
- *   size: network transfers suspend instead of blocking a thread, so the
- *   pool size does not limit how many connections a download can use.
+ * @param dispatchers dispatchers for task management, network operations and file I/O; by
+ *   default [KetchDispatchers.Default], which every instance in the process shares. Its pools
+ *   are bounded, but network transfers suspend instead of blocking a thread, so their size does
+ *   not limit how many connections a download can use. [close] closes dispatchers passed here
+ *   once its coroutines have finished, never [KetchDispatchers.Default].
  */
 @OptIn(ExperimentalAtomicApi::class)
 class Ketch(
@@ -133,7 +134,7 @@ class Ketch(
   private val fileNameResolver: FileNameResolver = DefaultFileNameResolver(),
   additionalSources: List<DownloadSource> = emptyList(),
   logger: Logger = Logger.None,
-  private val dispatchers: KetchDispatchers = KetchDispatchers(),
+  internal val dispatchers: KetchDispatchers = KetchDispatchers.Default,
 ) : KetchApi {
   private val startMark = TimeSource.Monotonic.markNow()
 
@@ -1099,6 +1100,10 @@ class Ketch(
     }
   }.distinctUntilChanged()
 
+  /**
+   * Stops every task and releases the engine, then closes [dispatchers] once its coroutines have
+   * finished; [KetchDispatchers.Default] stays open for every other instance.
+   */
   override fun close() {
     log.i { "Closing Ketch" }
     val executions = coordinator.close()
@@ -1106,7 +1111,9 @@ class Ketch(
     scope.cancel()
     sourceResolver.close()
     httpEngine.close()
-    closeDispatchersAfter(listOf(scope.coroutineContext.job, executions))
+    if (!dispatchers.isDefault) {
+      closeDispatchersAfter(listOf(scope.coroutineContext.job, executions))
+    }
   }
 
   /**

@@ -436,7 +436,7 @@ internal class DownloadCoordinator(
     val fa = if (source.managesOwnFileIo) {
       NoOpFileAccessor
     } else {
-      createFileAccessor(outputPath, dispatchers.io)
+      createFileAccessor(outputPath, dispatchers.disk)
     }
     val ctx = DownloadContext(
       taskId = handle.taskId,
