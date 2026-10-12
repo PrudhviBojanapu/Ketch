@@ -2,6 +2,7 @@
 
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation
 
 plugins {
   alias(libs.plugins.kotlinMultiplatform)
@@ -40,6 +41,10 @@ val generateVersion by tasks.registering {
 }
 
 kotlin {
+  // Checks the public API against the dump in api/.
+  @OptIn(ExperimentalAbiValidation::class)
+  abiValidation()
+
   android {
     namespace = "com.linroid.ketch.api"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
@@ -74,8 +79,9 @@ kotlin {
     commonMain {
       kotlin.srcDir(generateVersion)
       dependencies {
-        implementation(libs.kotlinx.coroutines.core)
-        implementation(libs.kotlinx.serialization.json)
+        // The public API exposes their types (Flow, StateFlow, KSerializer).
+        api(libs.kotlinx.coroutines.core)
+        api(libs.kotlinx.serialization.json)
         implementation(libs.kotlinx.datetime)
       }
     }

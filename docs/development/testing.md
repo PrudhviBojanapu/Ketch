@@ -66,6 +66,15 @@ runs on Windows; CI runs it in a Windows job of its own:
 ./gradlew :app:desktop:test --tests '*WindowsPortableScriptTest*'
 ```
 
+## Public API Dump
+
+CI fails when `library:api`'s public API differs from the dump in `library/api/api/`. After an
+intended change, update the dump and commit it:
+
+```shell
+./gradlew :library:api:updateKotlinAbi
+```
+
 ## Android distributions
 
 ```shell

@@ -58,6 +58,7 @@ import io.ktor.client.request.header
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -260,7 +261,7 @@ class RemoteKetch internal constructor(
    * controls, which fail closed against servers without them. Other keys return `null`.
    */
   @Suppress("UNCHECKED_CAST")
-  override fun <T : Any> control(key: ControlKey<T>): T? =
+  override fun <T : Any> controller(key: ControlKey<T>): T? =
     if (key === TorrentController.Key) torrents as T else null
 
   override suspend fun download(
@@ -293,11 +294,11 @@ class RemoteKetch internal constructor(
 
   override suspend fun resolve(
     url: String,
-    properties: Map<String, String>,
+    headers: Map<String, String>,
   ): ResolvedSource {
     val response = httpClient.post(Api.Resolve()) {
       contentType(ContentType.Application.Json)
-      setBody(ResolveUrlRequest(url, properties))
+      setBody(ResolveUrlRequest(url, headers))
     }
     checkSuccess(response)
     return response.body()
@@ -313,7 +314,8 @@ class RemoteKetch internal constructor(
     }
     when (response.status) {
       HttpStatusCode.UnsupportedMediaType -> throw KetchError.Unsupported()
-      HttpStatusCode.UnprocessableEntity -> throw response.body<KetchError>()
+      HttpStatusCode.UnprocessableEntity ->
+        throw json.decodeFromString(KetchError.tolerantSerializer(), response.bodyAsText())
       HttpStatusCode.PayloadTooLarge -> throw IllegalArgumentException("File is too large")
       HttpStatusCode.NotFound, HttpStatusCode.NotImplemented ->
         throw UnsupportedOperationException("Resolving file content is unavailable")
@@ -383,7 +385,7 @@ class RemoteKetch internal constructor(
     return response.body()
   }
 
-  override suspend fun updateNetworkInterfaces(config: NetworkInterfaceConfig): NetworkInterfaces {
+  override suspend fun selectNetworkInterfaces(config: NetworkInterfaceConfig): NetworkInterfaces {
     val response = httpClient.put(Api.NetworkInterfaces()) {
       contentType(ContentType.Application.Json)
       setBody(config)
