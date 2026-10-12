@@ -10,10 +10,9 @@ import com.linroid.ketch.core.engine.DownloadSource
 import com.linroid.ketch.core.file.FileAccessor
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.builtins.serializer
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertTrue
-import kotlinx.serialization.builtins.serializer
 
 class DownloadSourceCleanupTest {
 

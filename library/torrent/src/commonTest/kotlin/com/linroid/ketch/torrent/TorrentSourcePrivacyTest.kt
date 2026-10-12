@@ -7,7 +7,6 @@ import com.linroid.ketch.core.engine.DownloadContext
 import com.linroid.ketch.core.engine.SourceState
 import com.linroid.ketch.core.engine.resolve
 import com.linroid.ketch.core.engine.decodeState
-import com.linroid.ketch.core.engine.encodeState
 import com.linroid.ketch.core.file.FileAccessor
 import com.linroid.ketch.torrent.engine.TorrentEngine
 import com.linroid.ketch.torrent.engine.TorrentSession

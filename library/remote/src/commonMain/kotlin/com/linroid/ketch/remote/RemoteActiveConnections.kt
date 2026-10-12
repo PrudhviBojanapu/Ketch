@@ -12,7 +12,8 @@ import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.isSuccess
-import io.ktor.utils.io.readUTF8Line
+import io.ktor.utils.io.LineEnding
+import io.ktor.utils.io.readLine
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
@@ -70,7 +71,7 @@ private suspend fun HttpClient.readEvents(
     var last: String? = null
     val data = StringBuilder()
     while (true) {
-      val line = channel.readUTF8Line()
+      val line = channel.readLine(LineEnding.Lenient)
       // A blank line ends an event; so does the end of the stream, leniently.
       if (line.isNullOrEmpty()) {
         val event = name
