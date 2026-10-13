@@ -34,7 +34,7 @@ target sends links and page resources to a configured server.
 
 | Browser | Minimum version | Build |
 | --- | --- | --- |
-| Chrome, Edge, Brave, Opera, Vivaldi and other Chromium browsers | Chromium 116 | `build/chrome` |
+| Chrome, Edge, Brave, Opera, Vivaldi and other Chromium browsers | Chromium 116 | `build/chrome-store`, `build/chrome-unpacked` |
 | Firefox (desktop) | 128 | `build/firefox` |
 | Safari (macOS, limited features) | 16.4 | `build/safari` |
 
@@ -46,6 +46,12 @@ unavailable. See [Safari](#safari-limited-macos-target).
 
 - **Chrome, Edge, Brave and other Chromium browsers**: install Ketch from the
   [Chrome Web Store](https://chromewebstore.google.com/detail/flnjeochbgpaipiofdjmoijaeooemhka).
+  To install a release by hand, such as one the store is still reviewing, unzip its
+  `chrome-unpacked` package, open `chrome://extensions`, turn on **Developer mode**, choose
+  **Load unpacked** and select the folder. It has the store version's id, so it is the same
+  extension to Chrome and to the Ketch app: remove the store version first, and reinstall it from
+  the store once the review is done to get updates again. Not the `chrome-store` package: loaded
+  by hand, it gets an id from its folder that the Ketch app refuses.
 - **Firefox**: release versions of Firefox only install add-ons signed by Mozilla, and the Firefox
   package is what gets submitted to addons.mozilla.org for signing. Until it is signed, load it
   for the current session from `about:debugging#/runtime/this-firefox` with **Load Temporary
@@ -59,7 +65,9 @@ The extension has its own releases on the
 `extension-v<app version>.<number>` and named like "Browser extension 0.4.0.1"; each app release
 links the latest one under *Add Ketch to your browser*. Each includes:
 
-- `ketch-extension-<version>-chrome.zip`, the Chrome Web Store package;
+- `ketch-extension-<version>-chrome-unpacked.zip`, the Chromium package with the store item's
+  public key as the manifest `key`, for **Load unpacked**: it gets the store's id, which the Ketch
+  app accepts;
 - `ketch-extension-<version>-firefox.zip`;
 - `ketch-extension-<version>-safari.zip`, which contains extension sources, not an installable
   app.
@@ -355,8 +363,8 @@ The extension is plain JavaScript modules with no dependencies or bundler. `src/
 build, so it can be loaded as is while developing:
 
 - **Chromium**: open `chrome://extensions`, turn on **Developer mode**, choose **Load unpacked**
-  and select `src/`. Not `build/chrome`: without the `key`, Chrome gives it an id the Ketch app
-  does not accept.
+  and select `src/` (or `build/chrome-unpacked`). Not `build/chrome-store`: without the `key`,
+  Chrome gives it an id the Ketch app does not accept.
 - **Firefox**: run `npm run build`, open `about:debugging#/runtime/this-firefox`, choose **Load
   Temporary Add-on** and select `build/firefox/manifest.json`.
 
@@ -370,7 +378,8 @@ runs the unit tests with Node's built-in test runner (Node 22.3+), and
 npm run build
 ```
 
-writes `build/chrome`, `build/firefox`, `build/safari` and their zips.
+writes `build/chrome-store`, `build/chrome-unpacked`, `build/firefox`, `build/safari` and their
+zips.
 
 ### Extension ids
 
@@ -379,7 +388,8 @@ The `key` in `src/manifest.json` pins the Chromium extension id to
 the ids it lists start its host (`NativeHostRegistration.CHROMIUM_EXTENSION_IDS` in
 `app/desktop`). Extension stores assign their own id, so the packaged builds leave the `key` out.
 The Chrome Web Store id, `flnjeochbgpaipiofdjmoijaeooemhka`, is in that list too; add the Edge
-Add-ons id there once it is published. Firefox identifies the add-on by its gecko id,
+Add-ons id there once it is published. The `chrome-unpacked` package has the store item's public key
+(`STORE_KEY` in `build.mjs`) as its `key`, so a copy installed by hand gets the store's id. Firefox identifies the add-on by its gecko id,
 `ketch@linroid.github.io`, instead.
 
 ### What the build does
@@ -422,6 +432,7 @@ icons are rendered from the repository's `art/icon-app.svg` by `art/render-icons
 | `src/lib/ext.js` | The `browser` or `chrome` API namespace |
 | `src/_locales/` | Messages of each language |
 | `build.mjs` | Builds each browser's package |
+| `store-upload.mjs` | Uploads the store package to the Chrome Web Store and submits it for review |
 | `safari.mjs` | Generates the Safari Xcode project |
 | `test/` | Unit tests |
 
@@ -430,13 +441,39 @@ icons are rendered from the repository's `art/icon-app.svg` by `art/render-icons
 The extension is released apart from the apps, when it has changed, so a store review only follows
 changes to the extension:
 
-1. Run the `Extension Release` workflow (`.github/workflows/extension-release.yml`) from the
-   Actions tab. It takes the version of the latest app release, runs the tests, runs
-   `node build.mjs --version <app version> --build <run number>` and publishes the zips in a
-   GitHub release tagged `extension-v<app version>.<run number>`. That release is never marked
-   latest, since the desktop and CLI updaters read the latest release.
-2. Upload `ketch-extension-<app version>-chrome.zip` to the Chrome Web Store (or Edge Add-ons).
-   You can also build it locally with `npm run build`.
+Run the `Extension Release` workflow (`.github/workflows/extension-release.yml`) from the Actions
+tab. It takes the version of the latest app release, runs the tests and runs
+`node build.mjs --version <app version> --build <run number>`. Then it:
+
+1. keeps `ketch-extension-<version>-chrome-store.zip`, the Chrome Web Store package (no `key`),
+   with the run as the `chrome-store` artifact;
+2. with the [store secrets](#chrome-web-store-upload) set, uploads that package to the store and
+   submits it for review (`store-upload.mjs`); a refused upload stops the run before anything is
+   released. Without them it warns, and the artifact is uploaded by hand;
+3. publishes the other packages in a GitHub release tagged `extension-v<app version>.<run
+   number>`. That release is never marked latest, since the desktop and CLI updaters read the
+   latest release.
+
+Edge Add-ons, once listed there, takes the same store package by hand. You can also build the
+packages locally with `npm run build`.
+
+#### Chrome Web Store upload
+
+`store-upload.mjs` uses the Chrome Web Store API v2 with an OAuth refresh token. Set these
+repository secrets once (Settings → Secrets and variables → Actions):
+
+- `CWS_PUBLISHER_ID`: the publisher id, from the Developer Dashboard's account settings.
+- `CWS_CLIENT_ID` and `CWS_CLIENT_SECRET`: in a Google Cloud project, enable the Chrome Web Store
+  API, configure the OAuth consent screen (External, with the store account as a test user, or
+  published so the token doesn't expire after 7 days) and create an OAuth client of type
+  *Web application* with `https://developers.google.com/oauthplayground` as a redirect URI.
+- `CWS_REFRESH_TOKEN`: in the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground),
+  under its settings choose *Use your own OAuth credentials* with that client, authorize the
+  scope `https://www.googleapis.com/auth/chromewebstore` as the store account, and exchange the
+  code for tokens.
+
+The store account needs 2-step verification to publish. The script never prints the credentials,
+and it only submits an upload the store accepted with the version this run built.
 
 Browsers only accept versions made of numbers, so the run number becomes a fourth part (`0.3.1.7`)
 and every release is newer than the one before, as the stores require; Chromium shows the app

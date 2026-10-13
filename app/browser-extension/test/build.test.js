@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,13 +34,27 @@ describe('build', () => {
   const outputs = build({ outDir });
 
   test('builds for Chromium, Firefox and Safari', () => {
-    assert.deepEqual(outputs.map((it) => it.browser), ['chrome', 'firefox', 'safari']);
+    assert.deepEqual(outputs.map((it) => it.browser),
+      ['chrome-store', 'chrome-unpacked', 'firefox', 'safari']);
+  });
+
+  test('the Chromium package for unpacked installs has the Chrome Web Store id', () => {
+    const { zip } = outputs.find((it) => it.browser === 'chrome-unpacked');
+    const packaged = JSON.parse(zipEntry(zip, 'manifest.json'));
+    // Chromium's id: the first 16 bytes of the key's SHA-256, each hex digit as a to p.
+    const id = [...createHash('sha256').update(Buffer.from(packaged.key, 'base64')).digest('hex')
+      .slice(0, 32)].map((digit) => String.fromCharCode(97 + parseInt(digit, 16))).join('');
+    assert.equal(id, 'flnjeochbgpaipiofdjmoijaeooemhka');
+    const { key: _key, ...rest } = packaged;
+    const store = JSON.parse(zipEntry(outputs.find((it) => it.browser === 'chrome-store').zip,
+      'manifest.json'));
+    assert.deepEqual(rest, store);
   });
 
   test('Chromium zip omits the development key of src', () => {
     const source = JSON.parse(readFileSync(new URL('../src/manifest.json', import.meta.url), 'utf8'));
     assert.ok(source.key);
-    const { dir, zip } = outputs.find((it) => it.browser === 'chrome');
+    const { dir, zip } = outputs.find((it) => it.browser === 'chrome-store');
     const packaged = JSON.parse(zipEntry(zip, 'manifest.json'));
     assert.deepEqual(packaged, JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')));
     const { key: _key, ...expected } = source;
@@ -70,8 +85,8 @@ test('Chromium release package carries the release version and no key', () => {
   const outDir = mkdtempSync(join(tmpdir(), 'ketch-store-build-'));
   try {
     const outputs = build({ outDir, release: '1.2.3-rc1', buildNumber: '57' });
-    const { zip } = outputs.find((it) => it.browser === 'chrome');
-    assert.equal(zip, join(outDir, 'ketch-extension-1.2.3-rc1-chrome.zip'));
+    const { zip } = outputs.find((it) => it.browser === 'chrome-store');
+    assert.equal(zip, join(outDir, 'ketch-extension-1.2.3-rc1-chrome-store.zip'));
     const manifest = JSON.parse(zipEntry(zip, 'manifest.json'));
     assert.equal(manifest.version, '1.2.3.57');
     assert.equal(manifest.version_name, '1.2.3-rc1');

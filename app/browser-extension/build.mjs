@@ -2,8 +2,10 @@
 /**
  * Builds the extension for each browser family from `src/`:
  *
- *   build/chrome/    Chrome, Edge, Brave, Opera, Vivaldi and other Chromium browsers
- *   build/firefox/   Firefox
+ *   build/chrome-store/      Chromium browsers: the Chrome Web Store upload, without `key`
+ *   build/chrome-unpacked/   Chromium browsers: for Load unpacked, with the `key`
+ *   build/firefox/           Firefox
+ *   build/safari/            Safari sources for the Xcode project
  *   build/ketch-extension-<version>-<browser>.zip   packages for releases and extension stores
  *
  * Usage: node build.mjs [--version <release version>] [--build <number>]
@@ -59,15 +61,31 @@ export function releaseVersion(release, build) {
   return { version: parts.join('.'), versionName: release };
 }
 
+/**
+ * Public key of the Chrome Web Store item, which gives it the id
+ * `flnjeochbgpaipiofdjmoijaeooemhka`. A copy installed by hand with this key is that same
+ * extension to Chrome and to the Ketch app's native messaging host. Read from the header of the
+ * CRX the store serves for that id (Developer Dashboard: Package, View public key).
+ */
+export const STORE_KEY =
+  'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAncfF0APkvcQm1mVCFYqTA9dgOO2rDOyP1w8at1rO7sNV' +
+  'WJQssKrK2DhWE7DN8487fdR0cYr+NbV0aaOfJIikdImbC8/7buMdmkBxF3kbsgRxJKN0VdI/mogLJsPpAP4EN9dY' +
+  'vSIYiBzs7SaAbWBR728DR5OZ8sGggXhnnCXzgxsR3ihoN6T9csej86JhcdCMUtunI+g0ePgSSP5Fb9ZVU0zoqo11' +
+  'TH7olKcFG5T4oRUWM7zUtfAGbwL3XF7qJEHyC0/e4Qugw8as3g7y4Del9bsG/vpZVdNBjxtGImWwuHkxv1X6MPa4' +
+  'lpAtrMopwcUJwRcFKafiCNuUoxJI1ngzIwIDAQAB';
+
 /** @returns {Record<string, object>} the manifest for each browser build */
 function targetManifests({ version: manifestVersion, versionName }) {
   const base = { ...manifest, version: manifestVersion };
-  // Store uploads must omit the key, which only pins the id of unpacked `src/`.
+  // Store uploads must omit the key, which only pins the id of unpacked installs.
   const { key: _key, ...chrome } = versionName === manifestVersion
     ? base
     : { ...base, version_name: versionName };
   return {
-    chrome,
+    'chrome-store': chrome,
+    // For Load unpacked: the store's key gives it the store's id, which the Ketch app accepts
+    // for native messaging, where a copy without one gets an id from its folder.
+    'chrome-unpacked': { ...chrome, key: STORE_KEY },
     firefox: firefoxManifest(base),
     safari: safariManifest(base),
   };
