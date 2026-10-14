@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
@@ -49,10 +50,13 @@ import com.linroid.ketch.app.platform.localDeviceNoun
 import com.linroid.ketch.app.platform.localDeviceNounInSentence
 import com.linroid.ketch.app.platform.rememberSystemClipboard
 import com.linroid.ketch.app.state.AppState
-import com.linroid.ketch.app.ui.connect.PairingRequestCards
 import com.linroid.ketch.app.state.parseHostList
 import com.linroid.ketch.app.state.portError
 import com.linroid.ketch.app.theme.KetchTheme
+import com.linroid.ketch.app.ui.common.AdaptiveModal
+import com.linroid.ketch.app.ui.connect.PairingRequestCards
+import com.linroid.ketch.app.ui.connect.PairingWindowRow
+import com.linroid.ketch.app.ui.connect.ReportSharingShown
 import com.linroid.ketch.app.util.PairingLink
 import com.linroid.ketch.app.util.pairingAddresses
 import com.linroid.ketch.config.ServerConfig
@@ -60,6 +64,7 @@ import io.github.alexzhirkevich.qrose.options.QrBrush
 import io.github.alexzhirkevich.qrose.options.solid
 import io.github.alexzhirkevich.qrose.rememberQrCodePainter
 import ketch.app.shared.generated.resources.Res
+import ketch.app.shared.generated.resources.action_cancel
 import ketch.app.shared.generated.resources.action_show
 import ketch.app.shared.generated.resources.action_try_again
 import ketch.app.shared.generated.resources.settings_action_hide
@@ -86,7 +91,10 @@ import ketch.app.shared.generated.resources.settings_sharing_failed
 import ketch.app.shared.generated.resources.settings_sharing_local_only
 import ketch.app.shared.generated.resources.settings_sharing_looking
 import ketch.app.shared.generated.resources.settings_sharing_new_code
+import ketch.app.shared.generated.resources.settings_sharing_new_code_body
+import ketch.app.shared.generated.resources.settings_sharing_new_code_confirm
 import ketch.app.shared.generated.resources.settings_sharing_new_code_hint
+import ketch.app.shared.generated.resources.settings_sharing_new_code_title
 import ketch.app.shared.generated.resources.settings_sharing_no_address
 import ketch.app.shared.generated.resources.settings_sharing_no_code
 import ketch.app.shared.generated.resources.settings_sharing_off_hint
@@ -120,7 +128,9 @@ private val log = KetchLogger("SharingSettings")
 
 /**
  * Sharing of the embedded [device]: the Pair a device card, which lets a phone, a tablet or a
- * browser control it, then the sharing server's advanced settings.
+ * browser control it, then while it is shared its pairing requests and whether sharing starts
+ * with Ketch (on once sharing is turned on, off once it is stopped), then the sharing server's
+ * advanced settings.
  *
  * Settings are saved at once but read when sharing starts, so while it runs a change offers a
  * restart. Other devices share from their own Ketch, so they get a note instead.
@@ -153,6 +163,23 @@ fun SharingSettings(state: AppState, device: InstanceEntry) {
     manager.stopServer()
     manager.startServer()
   }
+  // A new code disconnects every paired device, so it is asked first.
+  var confirmingNewCode by remember { mutableStateOf(false) }
+  val makeNewCode = {
+    save(config.copy(apiToken = newToken()))
+    if (serverState is ServerState.Running) restart()
+  }
+  if (confirmingNewCode) {
+    NewCodeDialog(
+      onConfirm = {
+        confirmingNewCode = false
+        makeNewCode()
+      },
+      onDismiss = { confirmingNewCode = false },
+    )
+  }
+  ReportSharingShown(state)
+  // At the top, where a request that brought the owner here shows first.
   PairingRequestCards(state)
   PairCard(
     name = device.label,
@@ -165,17 +192,30 @@ fun SharingSettings(state: AppState, device: InstanceEntry) {
           host = ServerConfig.ANY_HOST,
           apiToken = config.apiToken ?: newToken(),
           mdnsEnabled = true,
+          // Sharing turned on stays on across restarts until it is stopped.
+          autoStart = true,
         ),
       )
       manager.startServer()
     },
-    onStop = { manager.stopServer() },
-    onNewCode = {
-      save(config.copy(apiToken = newToken()))
-      restart()
+    onStop = {
+      save(config.copy(autoStart = false))
+      manager.stopServer()
     },
+    onNewCode = { confirmingNewCode = true },
     onRefresh = { networks.loadNetworks() },
-  )
+  ) { running ->
+    // Devices find this one and ask to pair only while it is shared with them.
+    if (!running.config.isLoopbackOnly && running.config.apiToken != null) {
+      PairingWindowRow(manager.pairingRequests)
+    }
+    // Sharing turns it on and Stop sharing off, so it only shows while sharing.
+    SettingsSwitchRow(
+      title = stringResource(Res.string.settings_sharing_auto_start),
+      checked = config.autoStart,
+      onCheckedChange = { save(config.copy(autoStart = it)) },
+    )
+  }
   val running = serverState as? ServerState.Running
   // Starting with Ketch only matters at launch, so it never calls for a restart.
   if (running != null && running.config.copy(autoStart = config.autoStart) != config) {
@@ -196,16 +236,16 @@ fun SharingSettings(state: AppState, device: InstanceEntry) {
   AdvancedGroup(
     config = config,
     onChange = save,
+    // Creating the first code disconnects nobody.
     onRotate = {
-      save(config.copy(apiToken = newToken()))
-      if (serverState is ServerState.Running) restart()
+      if (config.apiToken.isNullOrEmpty()) makeNewCode() else confirmingNewCode = true
     },
   )
 }
 
 /**
  * The QR code and pairing link while this device is shared with other devices, or the button
- * that shares it.
+ * that shares it; while sharing runs, [whileSharing]'s rows follow in the same card.
  *
  * @param addresses addresses other devices reach this one at, best first; `null` while loading.
  * @param addressesReadable whether the device can tell its addresses at all.
@@ -220,6 +260,7 @@ private fun PairCard(
   onStop: () -> Unit,
   onNewCode: () -> Unit,
   onRefresh: () -> Unit,
+  whileSharing: @Composable ColumnScope.(ServerState.Running) -> Unit,
 ) {
   val spacing = KetchTheme.spacing
   val running = serverState as? ServerState.Running
@@ -276,6 +317,7 @@ private fun PairCard(
         }
       }
     }
+    if (running != null) whileSharing(running)
   }
 }
 
@@ -635,10 +677,40 @@ private fun AdvancedGroup(
         enabled = token.isNotEmpty(),
       )
     }
-    SettingsSwitchRow(
-      title = stringResource(Res.string.settings_sharing_auto_start),
-      checked = config.autoStart,
-      onCheckedChange = { onChange(config.copy(autoStart = it)) },
+  }
+}
+
+/**
+ * Asks before a new access code replaces the current one: every paired device is disconnected
+ * and has to pair again, and the pairing link and QR code shown so far stop working.
+ */
+@Composable
+internal fun NewCodeDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+  AdaptiveModal(
+    onDismissRequest = onDismiss,
+    title = { Text(stringResource(Res.string.settings_sharing_new_code_title)) },
+    confirmButton = {
+      KetchButton(
+        text = stringResource(Res.string.settings_sharing_new_code_confirm),
+        onClick = onConfirm,
+        variant = KetchButtonVariant.Danger,
+      )
+    },
+    dismissButton = {
+      KetchButton(
+        text = stringResource(Res.string.action_cancel),
+        onClick = onDismiss,
+        variant = KetchButtonVariant.Secondary,
+      )
+    },
+  ) {
+    Text(
+      text = stringResource(
+        Res.string.settings_sharing_new_code_body,
+        localDeviceNounInSentence().resolve(),
+      ),
+      style = KetchTheme.typography.bodyS,
+      color = KetchTheme.colors.textSecondary,
     )
   }
 }
@@ -656,7 +728,6 @@ internal val AdvancedRows = listOf(
   Res.string.settings_sharing_access_code,
   Res.string.settings_sharing_discoverable,
   Res.string.settings_sharing_websites,
-  Res.string.settings_sharing_auto_start,
 )
 private val QrSize = 180.dp
 private val QrPlaceholderGlyph = 48.dp
