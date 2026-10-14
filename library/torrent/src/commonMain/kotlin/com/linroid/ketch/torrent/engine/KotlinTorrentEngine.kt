@@ -9,6 +9,8 @@ import com.linroid.ketch.torrent.TorrentDispatchers
 import com.linroid.ketch.torrent.TorrentEncryption
 import com.linroid.ketch.torrent.TorrentMulticastLock
 import com.linroid.ketch.torrent.TorrentUploadPolicy
+import com.linroid.ketch.torrent.api.TorrentReachability
+import com.linroid.ketch.torrent.api.TorrentReachabilityStatus
 import com.linroid.ketch.torrent.crypto.torrentRandomBytes
 import com.linroid.ketch.torrent.decodeBase64
 import com.linroid.ketch.torrent.describeWithoutUrls
@@ -42,7 +44,9 @@ import com.linroid.ketch.torrent.net.TorrentListener
 import com.linroid.ketch.torrent.net.TorrentNetwork
 import com.linroid.ketch.torrent.net.TorrentUdpPort
 import com.linroid.ketch.torrent.net.createTorrentNetwork
+import com.linroid.ketch.torrent.net.numericAddress
 import com.linroid.ketch.torrent.net.numericHost
+import com.linroid.ketch.torrent.net.publicTorrentAddress
 import com.linroid.ketch.torrent.net.resolveTorrentHost
 import com.linroid.ketch.torrent.peer.PeerAttempt
 import com.linroid.ketch.torrent.peer.PeerIdentityHandshake
@@ -51,6 +55,8 @@ import com.linroid.ketch.torrent.peer.PeerOutcomeReport
 import com.linroid.ketch.torrent.peer.PeerWire
 import com.linroid.ketch.torrent.peer.classifyPeerOutcome
 import com.linroid.ketch.torrent.portmap.NatPmpClient
+import com.linroid.ketch.torrent.portmap.PcpClient
+import com.linroid.ketch.torrent.portmap.PortMapLayers
 import com.linroid.ketch.torrent.portmap.TorrentPortMapper
 import com.linroid.ketch.torrent.portmap.UpnpClient
 import com.linroid.ketch.torrent.storage.TorrentCheckpoint
@@ -112,8 +118,10 @@ import okio.ByteString.Companion.toByteString
 import okio.Path
 import okio.Path.Companion.toPath
 import kotlin.concurrent.atomics.AtomicBoolean
+import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.concurrent.atomics.incrementAndFetch
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
@@ -292,6 +300,10 @@ internal class KotlinTorrentEngine(
   private val dhtNodes = AtomicReference(emptyList<DhtNode>())
   // The router's public address while it maps our port; see isOwnAddress.
   private val mappedAddress = AtomicReference<String?>(null)
+  // What port mapping reached through the NAT layers, while it holds.
+  private val mappedLayers = AtomicReference<PortMapLayers?>(null)
+  // Peers that connected in over TCP since the engine started: proof that peers reach us.
+  private val incomingPeers = AtomicLong(0)
   /** DHT nodes peers named with `PORT`, waiting to be pinged; the oldest go when it is full. */
   private val dhtIntroductions = Channel<PeerEndpoint>(64, BufferOverflow.DROP_OLDEST)
   private val downloadRate = TorrentRateLimiter()
@@ -400,6 +412,11 @@ internal class KotlinTorrentEngine(
       PeerWire.decodeHandshake(header, InfoHash.fromBytes(tag))
       handedOff = route(tag.toByteString(), PrefixedConnection(stream, header))
       if (!handedOff) log.v { "Refused incoming peer ${connection.remote}: no accepting owner" }
+      // A punched uTP connection proves nothing about unsolicited ones, nor a peer on our own
+      // network about the internet; TCP from a public address does.
+      if (handedOff && !connection.utp && fromInternet(connection.remote)) {
+        incomingPeers.incrementAndFetch()
+      }
     } catch (e: TimeoutCancellationException) {
       log.v { "Refused incoming peer ${connection.remote}: no handshake within 15s" }
       reportUnrouted(connection.remote, attempt, e)
@@ -1224,6 +1241,31 @@ internal class KotlinTorrentEngine(
    * trackers and the DHT keep handing back. Another device behind the same router answers there
    * only through hairpin NAT; local discovery finds it on the LAN instead.
    */
+  /**
+   * Whether peers can connect to us; see [reachabilityStatus]. Peers on our own network do not
+   * count as having connected, nor do punched uTP connections.
+   */
+  internal fun reachability(): TorrentReachability {
+    if (!running.load()) return TorrentReachability()
+    val layers = mappedLayers.load()
+    val incoming = incomingPeers.load()
+    val observed = dhtNodes.load().firstNotNullOfOrNull { node ->
+      node.externalHost?.takeIf { ':' !in it }
+    }
+    val status = reachabilityStatus(incoming, layers, observed,
+      dhtRunning = dhtNodes.load().isNotEmpty())
+    return TorrentReachability(
+      status = status,
+      port = advertisedPort.current().takeIf { it != 0 },
+      forwardedLayers = layers?.layers ?: 0,
+      incomingPeers = incoming,
+      holePunching = utpEnabled.load(),
+    )
+  }
+
+  private fun fromInternet(peer: PeerEndpoint): Boolean =
+    numericAddress(peer.host)?.let(::publicTorrentAddress) == true
+
   private fun isOwnAddress(peer: PeerEndpoint): Boolean =
     peer.host == mappedAddress.load() || dhtNodes.load().any { it.externalHost == peer.host }
 
@@ -1475,6 +1517,7 @@ internal class KotlinTorrentEngine(
       }
       advertisedPort.setMapped(null)
       mappedAddress.store(null)
+      mappedLayers.store(null)
     }
     log.i { "Port mapping: ${if (enabled) "on" else "off"}" }
   }
@@ -1496,7 +1539,9 @@ internal class KotlinTorrentEngine(
       },
       onMapped = advertisedPort::setMapped,
       onExternalAddress = mappedAddress::store,
+      onLayers = mappedLayers::store,
       natPmp = NatPmpClient(directNetwork), upnp = UpnpClient(directNetwork),
+      pcp = PcpClient(directNetwork),
     ).also { it.start() }
   }
 
@@ -1614,4 +1659,29 @@ internal suspend fun resolveEndpoint(value: String): List<PeerEndpoint> {
   require(port != null && port in 1..65535) { "Invalid peer endpoint" }
   val host = value.substringBeforeLast(':').removeSurrounding("[", "]")
   return resolveTorrentHost(host).map { PeerEndpoint(numericHost(it), port) }
+}
+
+/**
+ * Whether peers can connect, from the TCP peers that connected in from the internet ([incoming]),
+ * the port mapped through the NAT [layers] and the IPv4 address the DHT [observed] us at:
+ * reachable once one has; forwarded when every layer up to a public address forwards our port
+ * and the DHT sees us at that address (or no DHT runs to say); unknown until a running DHT has
+ * seen us; blocked when a NAT outside the mapped routers does not forward (their outermost
+ * address is private, or the DHT sees us elsewhere); not forwarded without a mapping.
+ */
+internal fun reachabilityStatus(
+  incoming: Long,
+  layers: PortMapLayers?,
+  observed: String?,
+  dhtRunning: Boolean,
+): TorrentReachabilityStatus = when {
+  incoming > 0 -> TorrentReachabilityStatus.REACHABLE
+  layers == null -> TorrentReachabilityStatus.NOT_FORWARDED
+  !layers.public -> TorrentReachabilityStatus.BLOCKED
+  // DHT runs but has not seen our address yet: wait for it before saying peers connect.
+  // Without DHT nothing can confirm it; the mapping at a public address is all there is.
+  observed == null ->
+    if (dhtRunning) TorrentReachabilityStatus.UNKNOWN else TorrentReachabilityStatus.FORWARDED
+  observed != layers.externalAddress -> TorrentReachabilityStatus.BLOCKED
+  else -> TorrentReachabilityStatus.FORWARDED
 }
