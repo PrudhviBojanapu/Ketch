@@ -28,6 +28,7 @@ import com.linroid.ketch.app.feedback.AndroidNotifier
 import com.linroid.ketch.app.feedback.MessageNotifications
 import com.linroid.ketch.app.feedback.NotificationCopy
 import com.linroid.ketch.app.feedback.UnreadableFile
+import com.linroid.ketch.app.feedback.PairingNotices
 import com.linroid.ketch.app.feedback.pairingNotificationCopy
 import com.linroid.ketch.app.instance.InstanceFactory
 import com.linroid.ketch.app.instance.InstanceManager
@@ -58,6 +59,7 @@ import com.linroid.ketch.dash.DashDownloadSource
 import com.linroid.ketch.ftp.FtpDownloadSource
 import com.linroid.ketch.hls.HlsDownloadSource
 import com.linroid.ketch.server.KetchServer
+import com.linroid.ketch.server.systemProtectedDirectories
 import com.linroid.ketch.sqlite.DriverFactory
 import com.linroid.ketch.sqlite.createSqliteTaskStore
 import com.linroid.ketch.torrent.TorrentConfig
@@ -247,6 +249,8 @@ class KetchService : Service() {
             },
             allowedHosts = serverConfig.allowedHosts,
             allowedDirectories = serverConfig.allowedDirectories,
+            // The app's own files: its settings, database and token.
+            protectedDirectories = systemProtectedDirectories() + dataDir.path,
             mdnsEnabled = serverConfig.mdnsEnabled,
             mdnsRegistrar = AndroidMdnsRegistrar(),
             pairingApprover = { request, address ->
@@ -310,10 +314,10 @@ class KetchService : Service() {
       }
       AndroidNotifier.ACTION_PAUSE_ALL -> pauseAll()
       AndroidNotifier.ACTION_SLOW_LANE -> toggleSlowLane()
-      AndroidNotifier.ACTION_PAIRING_ALLOW, AndroidNotifier.ACTION_PAIRING_DENY -> {
-        val allow = intent.action == AndroidNotifier.ACTION_PAIRING_ALLOW
+      // Allowing happens in Settings › Sharing only; the notification can only turn it away.
+      AndroidNotifier.ACTION_PAIRING_DENY -> {
         val id = AndroidNotifier.pairingIdOf(intent)
-        if (id != null) instanceManager.pairingRequests.answer(id, allow)
+        if (id != null) instanceManager.pairingRequests.answer(id, allow = false)
       }
     }
     return START_STICKY
@@ -474,16 +478,18 @@ class KetchService : Service() {
   }
 
   /**
-   * Asks about each pairing request that arrives while the app is not in front, where it asks
-   * itself, from the notification shade, and withdraws the question once it is answered.
+   * Tells about each pairing request that waits while the app is not in front, when it arrives
+   * or once the app leaves the front, and withdraws the notification once it is answered. The
+   * owner answers in Settings › Sharing, which tapping it opens; inside the app a toast leads
+   * there.
    */
   private fun startPairingNotices() {
     scope.launch {
-      instanceManager.pairingRequests.watch(
-        onArrived = { ask ->
-          if (!inFront.value) notifier.showPairing(ask, pairingNotificationCopy(ask))
-        },
-        onLeft = notifier::cancelPairing,
+      PairingNotices.follow(
+        requests = instanceManager.pairingRequests,
+        inFront = inFront,
+        post = { ask -> notifier.showPairing(ask, pairingNotificationCopy(ask)) },
+        withdraw = notifier::cancelPairing,
       )
     }
   }

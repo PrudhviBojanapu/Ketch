@@ -12,9 +12,12 @@ import io.ktor.server.plugins.origin
 import io.ktor.server.resources.delete
 import io.ktor.server.resources.get
 import io.ktor.server.resources.post
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import kotlinx.serialization.json.Json
+import kotlin.math.ceil
+import kotlin.time.DurationUnit
 
 /**
  * Installs the pairing endpoints, which take no access token: a device asks for the token, the
@@ -43,14 +46,22 @@ internal fun Route.pairingRoutes(sessions: PairingSessions) {
       code = body.code,
       os = body.os?.let { shownText(it, MAX_OS_LENGTH) }?.ifEmpty { null },
     )
-    val ticket = sessions.open(request, call.request.origin.remoteAddress)
-    if (ticket == null) {
-      call.respond(
+    when (val opened = sessions.open(request, call.request.origin.remoteAddress)) {
+      is PairingSessions.Opened.Asking -> call.respond(HttpStatusCode.Accepted, opened.ticket)
+      PairingSessions.Opened.Busy -> call.respond(
         HttpStatusCode.TooManyRequests,
         ErrorResponse("pairing_busy", "Another pairing request is waiting for an answer"),
       )
-    } else {
-      call.respond(HttpStatusCode.Accepted, ticket)
+      is PairingSessions.Opened.Later -> {
+        // Rounded up, so a device that waits as long as it is told is not turned away again.
+        val seconds = ceil(opened.retryAfter.toDouble(DurationUnit.SECONDS)).toLong()
+          .coerceAtLeast(1)
+        call.response.header(HttpHeaders.RetryAfter, seconds)
+        call.respond(
+          HttpStatusCode.TooManyRequests,
+          ErrorResponse("pairing_paused", "Pairing requests are paused; try again in ${seconds}s"),
+        )
+      }
     }
   }
 
