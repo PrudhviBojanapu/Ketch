@@ -218,6 +218,11 @@ internal class KotlinTorrentEngine(
   }
   private val connectionBudget = TorrentConnectionBudget(utpFallback, config.maxConnections)
   private val network = TorrentPeerEncryption(connectionBudget, config.encryption)
+  // Handshakes still to name their torrent: a quarter of the budget (8 to 64), never more than
+  // half, so dials always find slots, even under a budget of one.
+  private val handshakes = TorrentHandshakeGate({
+    minOf((connectionBudget.limit / 4).coerceIn(8, 64), connectionBudget.limit / 2)
+  })
   private val udpMutex = Mutex()
   // Guarded by udpMutex.
   private val udpPorts = mutableMapOf<String, TorrentUdpPort>()
@@ -373,11 +378,17 @@ internal class KotlinTorrentEngine(
   /**
    * Negotiates MSE/PE when the peer opens with it and reads one BitTorrent handshake, within
    * 15 s, then hands the stream, with the handshake still to read, to the owner of its wire tag.
-   * Transport-agnostic; closes unless handed off.
+   * Transport-agnostic; closes unless handed off, and at once past [handshakes]' limits.
    */
   internal suspend fun dispatchIncoming(connection: TorrentConnection) {
     var handedOff = false
     val attempt = PeerAttempt(incoming = true).apply { utp = connection.utp }
+    val host = connection.remote.host
+    if (!handshakes.enter(host)) {
+      log.v { "Refused incoming peer ${connection.remote}: too many handshakes in progress" }
+      connection.close()
+      return
+    }
     try {
       // MSE/PE first when the peer opens with it, then the BitTorrent handshake.
       val (stream, header) = withTimeout(15_000) {
@@ -399,6 +410,7 @@ internal class KotlinTorrentEngine(
       log.v { "Refused incoming peer ${connection.remote}: ${e.describeWithoutUrls()}" }
       reportUnrouted(connection.remote, attempt, e)
     } finally {
+      handshakes.leave(host)
       if (!handedOff) connection.close()
     }
   }
