@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -32,19 +33,34 @@ android {
     create("play") { dimension = "distribution" }
   }
 
+  // The release key comes from the ANDROID_KEYSTORE_* variables (CI) or, on a developer's
+  // machine, from ketch.signing.* in the untracked local.properties. Debug builds use it too, so
+  // they install over release builds; without it they keep Android's debug key.
+  val localProperties = Properties().apply {
+    providers.fileContents(rootProject.layout.projectDirectory.file("local.properties"))
+      .asText.orNull?.let { load(it.reader()) }
+  }
+  fun signing(env: String, local: String): String? =
+    providers.environmentVariable(env).orNull ?: localProperties.getProperty("ketch.signing.$local")
+
   signingConfigs {
-    val keystoreFile = System.getenv("ANDROID_KEYSTORE_FILE")
+    val keystoreFile = signing("ANDROID_KEYSTORE_FILE", "storeFile")
     if (keystoreFile != null) {
       create("release") {
-        storeFile = file(keystoreFile)
-        storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
-        keyAlias = System.getenv("ANDROID_KEY_ALIAS")
-        keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+        storeFile = rootProject.file(keystoreFile)
+        storePassword = signing("ANDROID_KEYSTORE_PASSWORD", "storePassword")
+        keyAlias = signing("ANDROID_KEY_ALIAS", "keyAlias")
+        keyPassword = signing("ANDROID_KEY_PASSWORD", "keyPassword")
       }
     }
   }
 
   buildTypes {
+    debug {
+      signingConfigs.findByName("release")?.let {
+        signingConfig = it
+      }
+    }
     release {
       isMinifyEnabled = true
       isShrinkResources = true
@@ -92,6 +108,18 @@ android {
         "DebugProbesKt.bin",
         "org/fusesource/**",
       )
+    }
+  }
+}
+
+// Releases take the workflow's run number as their version code. A debug build signed with the
+// release key gets one above any of them unless -PversionCode names one, so it installs over a
+// release install; a release then needs the debug build uninstalled first.
+if (!providers.gradleProperty("versionCode").isPresent) {
+  androidComponents {
+    onVariants(selector().withBuildType("debug")) { variant ->
+      // Below Play's 2,100,000,000 limit, and far above any release's run number.
+      variant.outputs.forEach { it.versionCode.set(2_000_000_000) }
     }
   }
 }
