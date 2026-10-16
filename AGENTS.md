@@ -1268,7 +1268,8 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   and uses the controls in `components/` and `KetchIcon`. `DesignTokenUsageTest` fails when
   code outside `theme/` and `components/` adds literal radii, colors or text sizes,
   `MaterialTheme.` or Material icons; keep its allowlist (`design-token-allowlist.txt`) empty.
-  Composables read the time from `LocalClock`, never `Clock.System`. Surfaces take their shadows
+  Composables read the time from `LocalClock`, never `Clock.System`, and measure elapsed time
+  with `LocalTimeSource`, never `TimeSource.Monotonic`. Surfaces take their shadows
   from `ketchSurface`, which draws them with `elevationShadow`: on Skia (desktop, iOS, web,
   `skikoMain`) a blurred shape Skia draws on the GPU, as `Modifier.dropShadow` builds a CPU bitmap
   per size, which resizes and animations piled up (`ElevationShadowTest` keeps them alike);

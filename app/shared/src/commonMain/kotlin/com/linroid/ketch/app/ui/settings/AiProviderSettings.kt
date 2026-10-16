@@ -37,6 +37,7 @@ import com.linroid.ketch.app.icons.KetchIconImage
 import com.linroid.ketch.app.state.AiConnectionTest
 import com.linroid.ketch.app.state.AiModelList
 import com.linroid.ketch.app.state.AppState
+import com.linroid.ketch.app.state.LocalTimeSource
 import com.linroid.ketch.app.theme.KetchTheme
 import com.linroid.ketch.app.ui.common.AdaptiveModal
 import com.linroid.ketch.config.AiSettings
@@ -95,7 +96,6 @@ import org.jetbrains.compose.resources.pluralStringResource
 import org.jetbrains.compose.resources.stringResource
 import kotlin.time.Duration
 import kotlin.time.TimeMark
-import kotlin.time.TimeSource
 
 /** Which provider the editor shows: a new one, or the saved one with [Edit.id]. */
 private sealed interface ProviderEdit {
@@ -564,6 +564,7 @@ private fun TestSection(state: AppState, entry: LlmSettings) {
   val ai = state.aiSettings
   val test = if (ai.testedId == entry.id) ai.connectionTest else AiConnectionTest.Idle
   // How long the last test took, measured from the click.
+  val timeSource = LocalTimeSource.current
   var started by remember { mutableStateOf<TimeMark?>(null) }
   var took by remember { mutableStateOf<Duration?>(null) }
   LaunchedEffect(test) {
@@ -594,7 +595,7 @@ private fun TestSection(state: AppState, entry: LlmSettings) {
         stringResource(Res.string.settings_ai_test_button)
       },
       onClick = {
-        started = TimeSource.Monotonic.markNow()
+        started = timeSource.markNow()
         took = null
         state.launchCommand { ai.testConnection(entry) }
       },
