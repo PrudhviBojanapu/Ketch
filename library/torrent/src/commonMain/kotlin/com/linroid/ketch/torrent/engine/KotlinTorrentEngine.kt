@@ -23,6 +23,7 @@ import com.linroid.ketch.torrent.lsd.LsdTransport
 import com.linroid.ketch.torrent.lsd.TorrentLocalDiscovery
 import com.linroid.ketch.torrent.magnet.MAX_METADATA_PEERS
 import com.linroid.ketch.torrent.magnet.MagnetUri
+import com.linroid.ketch.torrent.magnet.MetadataLookupFailure
 import com.linroid.ketch.torrent.magnet.PrivateTorrentMagnetException
 import com.linroid.ketch.torrent.magnet.TorrentMetadataCache
 import com.linroid.ketch.torrent.magnet.TorrentMetadataExchange
@@ -536,7 +537,7 @@ internal class KotlinTorrentEngine(
     check(isRunning)
     val magnet = MagnetUri.parse(magnetUri)
     val restrictedTiers = if (privacy == TorrentDiscoveryPrivacy.TRACKER_ONLY) {
-      TrackerConfiguration.prepare(magnet.trackers.map { listOf(it) }).tiers.also {
+      TrackerConfiguration.usable(magnet.trackers.map { listOf(it) }).tiers.also {
         require(it.isNotEmpty()) { "Tracker-only magnets require supplied trackers" }
       }
     } else emptyList()
@@ -628,7 +629,8 @@ internal class KotlinTorrentEngine(
       "Fetching v2 metadata for magnet ${topic.logHash()}: privacy=$privacy, " +
         "trackers=${magnet.trackers.size}, timeout=$magnetLookupTime"
     }
-    val tiers = TrackerConfiguration.prepare(magnet.trackers.map { listOf(it) }).tiers
+    // Trackers Ketch cannot announce to, such as `wss://` ones, are left out.
+    val tiers = TrackerConfiguration.usable(magnet.trackers.map { listOf(it) }).tiers
     require(privacy != TorrentDiscoveryPrivacy.TRACKER_ONLY || tiers.isNotEmpty()) {
       "Tracker-only magnets require supplied trackers"
     }
@@ -637,7 +639,7 @@ internal class KotlinTorrentEngine(
         budget = exchangeBudgets.metadata, peerId = peerId.toByteString())
         .fetch(magnet.identity, endpoint, tiers, privacy, magnet.webSeeds)
     if (privacy == TorrentDiscoveryPrivacy.TRACKER_ONLY) {
-      var attempts = 0
+      val asked = HashSet<PeerEndpoint>()
       while (isActive) {
         var interval = 30L
         for (url in tiers.flatten().distinct()) {
@@ -649,8 +651,18 @@ internal class KotlinTorrentEngine(
             started = true
             interval = maxOf(interval, response.intervalSeconds)
             for (endpoint in response.peers.distinct()) {
-              check(++attempts <= MAX_METADATA_PEERS) { "Metadata peer limit exceeded" }
-              attempt { fetch(endpoint) }?.let { return@withTimeout it }
+              // Peers asked before are asked again; new ones only below the cap.
+              if (endpoint !in asked && asked.size >= MAX_METADATA_PEERS) continue
+              asked += endpoint
+              try {
+                return@withTimeout fetch(endpoint)
+              } catch (e: MetadataLookupFailure) {
+                throw e
+              } catch (e: CancellationException) {
+                if (!isActive) throw e
+              } catch (_: Exception) {
+                // Only other peers returned by these trackers are eligible retries.
+              }
             }
           } finally {
             if (started) withContext(NonCancellable) {
@@ -682,7 +694,7 @@ internal class KotlinTorrentEngine(
     trackerTiers: List<List<String>>,
   ): TorrentMetadata {
     val urls = trackerTiers.flatten().distinct()
-    var attempts = 0
+    val asked = HashSet<PeerEndpoint>()
     while (currentCoroutineContext().isActive) {
       var retrySeconds = 30L
       for (url in urls) {
@@ -698,12 +710,16 @@ internal class KotlinTorrentEngine(
           contacted = true
           retrySeconds = maxOf(retrySeconds, result.intervalSeconds)
           for (endpoint in result.peers.distinct()) {
-            check(++attempts <= MAX_METADATA_PEERS) { "Metadata peer limit exceeded" }
+            // Peers asked before are asked again; new ones only below the cap.
+            if (endpoint !in asked && asked.size >= MAX_METADATA_PEERS) continue
+            asked += endpoint
             try {
               return TorrentMetadataExchange(network, config.maxMetadataBytes,
                 budget = exchangeBudgets.metadata, peerId = peerId.toByteString())
                 .fetch(magnet.infoHash, endpoint, trackerTiers,
                   TorrentDiscoveryPrivacy.TRACKER_ONLY)
+            } catch (error: MetadataLookupFailure) {
+              throw error
             } catch (error: CancellationException) {
               if (!currentCoroutineContext().isActive) throw error
             } catch (_: Exception) {
