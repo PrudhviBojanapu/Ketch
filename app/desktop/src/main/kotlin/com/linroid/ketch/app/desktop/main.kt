@@ -101,6 +101,7 @@ import com.linroid.ketch.config.TorrentEncryptionMode
 import com.linroid.ketch.config.TorrentUploadMode
 import com.linroid.ketch.config.defaultConfigDir
 import com.linroid.ketch.core.Ketch
+import com.linroid.ketch.core.geo.DbIpCountryDatabase
 import com.linroid.ketch.engine.KtorHttpEngine
 import com.linroid.ketch.engine.withNetworkInterfaces
 import com.linroid.ketch.dash.DashDownloadSource
@@ -706,6 +707,7 @@ private fun createInstanceManager(
             FtpDownloadSource(), torrentSource,
             HlsDownloadSource(httpEngine), DashDownloadSource(httpEngine)
           ),
+          countries = DbIpCountryDatabase(File(configDir, COUNTRY_DATABASE_FILE)),
         ).also { ketch ->
           launch.localApiServer.attach(ketch)
           // The app runs this computer's downloads, so it runs the hooks of config.toml; for the
@@ -1239,6 +1241,7 @@ private const val LOGS_DIR = "logs"
 private const val UPDATES_DIR = "updates"
 private const val UPDATE_LOG = "update.log"
 private const val DISCOVER_HISTORY_FILE = "discover-history.json"
+private const val COUNTRY_DATABASE_FILE = "dbip-country-lite.csv.gz"
 private const val MAIN_WINDOW_STATE = "main-window"
 private const val ADDED_NAMES_SHOWN = 3
 private val ADDED_COALESCE_WINDOW = 1.seconds
