@@ -174,7 +174,7 @@ internal class KotlinTorrentSession(
             recover()
             try {
               store.replaceTrackerConfiguration(candidate, received.load(), uploaded.load(),
-                expectedRevision)
+                discarded.load(), expectedRevision)
             } finally {
               withContext(NonCancellable) {
                 // Cancellation at the I/O return boundary does not imply that rename rolled back.
@@ -257,6 +257,8 @@ internal class KotlinTorrentSession(
   /** Peers local service discovery found, for the swarm summary. */
   private val localPeers = AtomicInt(0)
   private val uploaded = AtomicLong(checkpoint?.uploadedBytes ?: 0)
+  /** Payload received that was thrown away: duplicates, corrupt or abandoned pieces. */
+  private val discarded = AtomicLong(checkpoint?.discardedBytes ?: 0)
   private val clock = monotonicClock()
   private val speedMutex = Mutex()
   private var sampleTime = clock()
@@ -286,6 +288,7 @@ internal class KotlinTorrentSession(
   val failure: StateFlow<Throwable?> get() = _failure
   val receivedBytes: Long get() = received.load()
   val uploadedBytes: Long get() = uploaded.load()
+  val discardedBytes: Long get() = discarded.load()
   override val downloadSpeed: Long get() = if (clock() - lastPayload.load() > 2000) 0
     else currentSpeed.load()
   val uploadSpeed: Long get() = if (clock() - lastUpload.load() > 2000) 0
@@ -302,7 +305,7 @@ internal class KotlinTorrentSession(
   }
 
   override suspend fun payloadCounters(): TorrentPayloadCounters =
-    TorrentPayloadCounters(received.load(), uploaded.load(), uploadSpeed)
+    TorrentPayloadCounters(received.load(), uploaded.load(), uploadSpeed, discarded.load())
 
   private fun countUploaded(bytes: Int) {
     val total = uploaded.addAndFetch(bytes.toLong())
@@ -416,7 +419,7 @@ internal class KotlinTorrentSession(
         }
         if (store.completed() && uploadPolicy() != TorrentUploadPolicy.SEED_AFTER_COMPLETION &&
           store.finishIfComplete()) {
-          store.persistCheckpoint(received.load(), uploaded.load())
+          store.persistCheckpoint(received.load(), uploaded.load(), discarded.load())
           _state.value = TorrentSessionState.FINISHED
           log.i { "Torrent $label is already complete" }
           return@launch
@@ -467,9 +470,10 @@ internal class KotlinTorrentSession(
               },
               uploadRate = engineUploadRate, sessionUploadRate = uploadRate,
               onUploaded = ::countUploaded,
+              onDiscarded = { discarded.addAndFetch(it) },
               onProgress = { _downloadedBytes.value = it },
               onCompleted = {
-                store.persistCheckpoint(received.load(), uploaded.load())
+                store.persistCheckpoint(received.load(), uploaded.load(), discarded.load())
                 _state.value = if (uploadPolicy() == TorrentUploadPolicy.SEED_AFTER_COMPLETION) {
                   TorrentSessionState.SEEDING
                 } else TorrentSessionState.FINISHED
@@ -487,7 +491,7 @@ internal class KotlinTorrentSession(
             ).run(peers, incoming, resets, selectionSignals)
             // A swarm returns while seeding only once the policy stops seeding.
             if (_state.value == TorrentSessionState.SEEDING) {
-              store.persistCheckpoint(received.load(), uploaded.load())
+              store.persistCheckpoint(received.load(), uploaded.load(), discarded.load())
               _state.value = TorrentSessionState.FINISHED
               log.i { "Torrent $label stopped seeding: upload policy changed" }
             }
@@ -535,6 +539,7 @@ internal class KotlinTorrentSession(
                 workspace = null
                 received.store(maxOf(received.load(), saved.receivedBytes))
                 uploaded.store(maxOf(uploaded.load(), saved.uploadedBytes))
+                discarded.store(maxOf(discarded.load(), saved.discardedBytes))
               }
             }
           }
@@ -549,6 +554,7 @@ internal class KotlinTorrentSession(
       }
       received.store(maxOf(received.load(), saved.receivedBytes))
       uploaded.store(maxOf(uploaded.load(), saved.uploadedBytes))
+      discarded.store(maxOf(discarded.load(), saved.discardedBytes))
     }
     trackerCheckpointRecovered = true
   }
@@ -574,7 +580,9 @@ internal class KotlinTorrentSession(
       lifecycle.withLock {
         if (!closed) {
           stopLocked()
-          if (canSaveCheckpoint()) store.persistCheckpoint(received.load(), uploaded.load())
+          if (canSaveCheckpoint()) {
+            store.persistCheckpoint(received.load(), uploaded.load(), discarded.load())
+          }
         }
       }
     }
@@ -588,7 +596,7 @@ internal class KotlinTorrentSession(
     val pending = scope.async {
       lifecycle.withLock {
         if (closed || !canSaveCheckpoint()) null
-        else store.persistCheckpoint(received.load(), uploaded.load())
+        else store.persistCheckpoint(received.load(), uploaded.load(), discarded.load())
       }
     }
     try { return pending.await() } finally {

@@ -303,7 +303,8 @@ internal class TorrentV2DownloadSession private constructor(
   }
 
   override suspend fun payloadCounters(): TorrentPayloadCounters =
-    TorrentPayloadCounters(store.receivedBytes(), store.uploadedBytes(), uploadSpeed())
+    TorrentPayloadCounters(store.receivedBytes(), store.uploadedBytes(), uploadSpeed(),
+      store.discardedBytes())
 
   private class UploadSample(val atMs: Long, val bytes: Long, val speed: Long)
   private val clock = monotonicClock()
@@ -637,12 +638,13 @@ internal class TorrentV2DownloadSession private constructor(
     val webSeedThrottled = AtomicLong(0)
     val webSeeds = TorrentV2WebSeeds.of(document, layout, store, runtime.webSeedHttp, reporter,
       label, webSeedRetryMs) { bytes ->
+      // Received before it waits, so a stop meanwhile leaves it to be counted as discarded.
+      store.recordReceived(bytes)
       val start = clock()
       globalRate.acquire(bytes)
       downloadRate.acquire(bytes)
       taskThrottle.load()(bytes)
       webSeedThrottled.addAndFetch(clock() - start)
-      store.recordReceived(bytes)
     }
     val mirrors = webSeeds?.let { launch { it.run() } }
     try {

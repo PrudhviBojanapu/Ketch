@@ -24,6 +24,7 @@ import com.linroid.ketch.torrent.v1.TorrentPieceScheduler
 import com.linroid.ketch.torrent.v1.TorrentSwarm
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.decrementAndFetch
 import kotlin.concurrent.atomics.incrementAndFetch
@@ -35,6 +36,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -49,6 +52,7 @@ import okio.FileSystem
 import okio.IOException
 import okio.Path
 
+@OptIn(ExperimentalAtomicApi::class)
 class TorrentWebSeedTest {
   private fun hashes(payload: ByteArray, pieceLength: Int): ByteArray =
     payload.asList().chunked(pieceLength).fold(ByteArray(0)) { result, chunk ->
@@ -106,12 +110,19 @@ class TorrentWebSeedTest {
     }
   }
 
+  /** What a swarm's web seeds received, and of it threw away. */
+  private class Payload {
+    val received = AtomicLong(0)
+    val discarded = AtomicLong(0)
+  }
+
   /** Runs a swarm without peers: discovery is closed from the start. */
   private suspend fun runSwarm(
     store: TorrentPieceStore,
     vararg engines: HttpEngine,
     connections: RecordingConnections = RecordingConnections(),
     buffers: Int = 4 * 1024 * 1024,
+    payload: Payload = Payload(),
   ) {
     val network = createTorrentNetwork()
     val peers = Channel<PeerEndpoint>().also { it.close() }
@@ -119,6 +130,8 @@ class TorrentWebSeedTest {
     try {
       // One engine per seed: each worker gets the one its URL's host names.
       TorrentSwarm(store, network, budget, reporter = connections,
+        downloadPayload = { payload.received.addAndFetch(it.toLong()) },
+        onDiscarded = { payload.discarded.addAndFetch(it) },
         webSeedHttp = TorrentHttp(mirrorHosts(*engines)), webSeedRetryMs = 5).run(peers)
       assertEquals(0, budget.allocated)
     } finally {
@@ -300,12 +313,54 @@ class TorrentWebSeedTest {
         // A byte of piece 5 is wrong in the first response only.
         val mirror = MirrorEngine(mapOf(url to payload), damage = mapOf(url to 5L * PIECE + 100))
         withStore(singleFile(payload, url)) { store, output ->
-          runSwarm(store, mirror)
+          val counted = Payload()
+          runSwarm(store, mirror, payload = counted)
           assertTrue(store.completed())
           assertContentEquals(payload, torrentFileSystem.read(output) { readByteArray() })
           // Pieces 0 to 4 were kept; the next run starts at the corrupt piece.
           assertEquals(listOf(0L..<16L * PIECE, 5L * PIECE..<16L * PIECE),
             mirror.requests.map { it.second })
+          // The corrupt piece, and what came of the run after it, were thrown away.
+          assertTrue(counted.discarded.load() >= PIECE)
+          assertEquals(payload.size.toLong(), counted.received.load() - counted.discarded.load())
+        }
+      }
+    }
+  }
+
+  @Test
+  fun stoppedWhileThrottled_countsTheWaitingChunkAsDiscarded() = runTest {
+    withContext(Dispatchers.Default) {
+      withTimeout(15_000) {
+        val payload = ByteArray(4 * PIECE) { (it * 5 + 3).toByte() }
+        val url = "http://mirror.test/data"
+        withStore(singleFile(payload, url)) { store, _ ->
+          val counted = Payload()
+          val waiting = CompletableDeferred<Unit>()
+          val network = createTorrentNetwork()
+          val peers = Channel<PeerEndpoint>().also { it.close() }
+          try {
+            val swarm = launch {
+              TorrentSwarm(store, network, TorrentBufferBudget(4 * 1024 * 1024),
+                downloadPayload = { size ->
+                  // Counted, then held by the limits before the first piece is in.
+                  if (counted.received.addAndFetch(size.toLong()) > PIECE) {
+                    waiting.complete(Unit)
+                    awaitCancellation()
+                  }
+                },
+                onDiscarded = { counted.discarded.addAndFetch(it) },
+                webSeedHttp = TorrentHttp(MirrorEngine(mapOf(url to payload))),
+              ).run(peers)
+            }
+            waiting.await()
+            swarm.cancelAndJoin()
+          } finally {
+            network.close()
+          }
+          assertEquals(0, store.verifiedPieces().count { it })
+          assertTrue(counted.received.load() > PIECE)
+          assertEquals(counted.received.load(), counted.discarded.load())
         }
       }
     }
@@ -320,11 +375,15 @@ class TorrentWebSeedTest {
         // The first response ends halfway through piece 3.
         val mirror = MirrorEngine(mapOf(url to payload), drop = mapOf(url to 3 * PIECE + 500))
         withStore(singleFile(payload, url)) { store, output ->
-          runSwarm(store, mirror)
+          val counted = Payload()
+          runSwarm(store, mirror, payload = counted)
           assertTrue(store.completed())
           assertContentEquals(payload, torrentFileSystem.read(output) { readByteArray() })
           assertEquals(listOf(0L..<8L * PIECE, 3L * PIECE..<8L * PIECE),
             mirror.requests.map { it.second })
+          // The part of piece 3 the dropped run brought is fetched again.
+          assertEquals(500L, counted.discarded.load())
+          assertEquals(8L * PIECE + 500, counted.received.load())
         }
       }
     }

@@ -128,6 +128,12 @@ internal class TorrentSwarm(
   private val sessionUploadRate: TorrentRateLimiter = TorrentRateLimiter(),
   /** Payload the limits admitted for a peer, counted just before it is written. */
   private val onUploaded: (Int) -> Unit = {},
+  /**
+   * Payload [downloadPayload] counted that is thrown away rather than verified: blocks nobody
+   * asked for or another copy of which came first, pieces that fail their hash check, and partial
+   * pieces given up, from peers and web seeds alike.
+   */
+  private val onDiscarded: (Long) -> Unit = {},
   private val onProgress: suspend (Long) -> Unit = {},
   private val onCompleted: suspend () -> Unit = {},
   /** A selection change made a completed swarm incomplete; it downloads again, then completes. */
@@ -244,7 +250,7 @@ internal class TorrentSwarm(
       return@supervisorScope
     }
     val scheduler = TorrentPieceScheduler(BooleanArray(store.pieceCount) { store.needed(it) },
-      store.verifiedPieces(), store::pieceSize, budget, nowMs)
+      store.verifiedPieces(), store::pieceSize, budget, nowMs, onDiscarded)
     // Any piece may become wanted, and the first is the longest.
     val largestPiece = if (store.pieceCount == 0) 0 else store.pieceSize(0)
     val peerOverhead = PEER_WIRE_BYTES + store.pieceCount * 4
@@ -397,7 +403,8 @@ internal class TorrentSwarm(
     // One worker per seed for the whole transfer: started again, a seed keeps what it learned.
     val webSeedWorkers = webSeedUrls.mapIndexed { number, url ->
       WebSeedWorker(url, webSeedPieces[number], checkNotNull(webSeedHttp), webSeedStats,
-        logLabel, reporter, webSeedRetryMs, downloadPayload = webSeedPayload)
+        logLabel, reporter, webSeedRetryMs, downloadPayload = webSeedPayload,
+        discardPayload = onDiscarded)
     }
     fun launchWebSeed(number: Int): Job = launch(TorrentDispatchers.engine) {
       try {
@@ -1072,7 +1079,13 @@ internal class TorrentSwarm(
       }
       require(fast || !message.isFastExtension()) { "Fast extension message without BEP 6" }
       val wasChoking = state.choking
-      val accepted = state.received(message)
+      val accepted = try {
+        state.received(message)
+      } catch (e: IllegalArgumentException) {
+        // A block nobody asked for, which closes the peer.
+        if (message is PeerMessage.Piece) onDiscarded(message.bytes.size.toLong())
+        throw e
+      }
       if (state.choking != wasChoking) {
         connectedMutex.withLock { if (state.choking) unchoking.remove(id) else unchoking.add(id) }
       }
@@ -1105,6 +1118,9 @@ internal class TorrentSwarm(
         is PeerMessage.Piece -> if (accepted) {
           receiveBlock(message)
           chokerMutex.withLock { choker.received(id, message.bytes.size.toLong()) }
+        } else {
+          // A block we canceled that came anyway.
+          onDiscarded(message.bytes.size.toLong())
         }
         is PeerMessage.Reject -> if (accepted) rejected(message)
         is PeerMessage.Request -> request(message)

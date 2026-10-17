@@ -232,8 +232,14 @@ internal class WebSeedWorker<P : WebSeedPiece>(
   private val reporter: ConnectionReporter = ConnectionReporter.None,
   private val retryMs: Long = WEB_SEED_RETRY_MS,
   private val idleTimeoutMs: Long = WEB_SEED_IDLE_MS,
-  /** Counts and rate-limits payload, as for peers. */
+  /** Counts payload as received, then rate-limits it, as for peers. */
   private val downloadPayload: suspend (Int) -> Unit = {},
+  /**
+   * Counts the payload [downloadPayload] counted that no verified piece keeps: pieces that fail
+   * their hash check or that the selection dropped, and those a failed or stopped run gives back
+   * partly or wholly fetched. Called once a run ends.
+   */
+  private val discardPayload: (Long) -> Unit = {},
 ) {
   private val log = KetchLogger("TorrentWebSeed")
   private val label = redactUrl(url)
@@ -390,7 +396,8 @@ internal class WebSeedWorker<P : WebSeedPiece>(
    * run of many small files spent most of its time waiting for answers, and on mirrors that
    * redirect each file, as archive.org does, for two of them per file. A mirror that fails sees
    * one request per run. What arrived for the pieces a failed run gives back unstored counts as
-   * [WebSeedStats.wasted]; until stored or thrown away, it is [WebSeedStats.unsettled].
+   * [WebSeedStats.wasted]; until stored or thrown away, it is [WebSeedStats.unsettled]. Once the
+   * run ends, whatever arrived that no verified piece keeps goes to [discardPayload].
    */
   private suspend fun fetch(run: MutableList<P?>) {
     val handle = connection ?: open().also { connection = it }
@@ -399,9 +406,11 @@ internal class WebSeedWorker<P : WebSeedPiece>(
     val missing = IntArray(run.size)
     for (request in requests) for (part in request.parts) missing[part.piece] += part.length
     val asked = missing.copyOf()
-    // What arrived for the run, and of it what was stored and so settled.
+    // What arrived for the run, of it what was stored and so settled, and of that what verified
+    // pieces keep.
     val arrived = AtomicLong(0)
     val stored = AtomicLong(0)
+    val verified = AtomicLong(0)
     try {
       for (piece in run.indices) if (run[piece] != null && missing[piece] == 0) store(run, piece)
       // A piece spanning files completes from whichever request brings its last part.
@@ -410,7 +419,7 @@ internal class WebSeedWorker<P : WebSeedPiece>(
         completion.withLock {
           missing[piece] -= length
           if (missing[piece] == 0) {
-            store(run, piece)
+            if (store(run, piece)) verified.addAndFetch(asked[piece].toLong())
             stored.addAndFetch(asked[piece].toLong())
             stats.unsettled.addAndFetch(-asked[piece].toLong())
           }
@@ -432,6 +441,10 @@ internal class WebSeedWorker<P : WebSeedPiece>(
     } finally {
       // The rest is settled once counted as wasted, so none of it looks kept meanwhile.
       stats.unsettled.addAndFetch(stored.load() - arrived.load())
+      // Counted as it arrived, before the throttle, so a run stopped while it waits still counts
+      // the chunk; a piece the selection dropped is discarded too.
+      val discarded = arrived.load() - verified.load()
+      if (discarded > 0) discardPayload(discarded)
     }
   }
 
@@ -496,8 +509,11 @@ internal class WebSeedWorker<P : WebSeedPiece>(
     if (total != length) throw IOException("Web seed response ended early")
   }
 
-  /** Stores piece [piece] of [run] and gives it back; a corrupt piece fails the run. */
-  private suspend fun store(run: MutableList<P?>, piece: Int) {
+  /**
+   * Stores piece [piece] of [run] and gives it back, returning whether it verified; a corrupt
+   * piece fails the run.
+   */
+  private suspend fun store(run: MutableList<P?>, piece: Int): Boolean {
     val claim = checkNotNull(run[piece])
     val outcome = webSeedStorage { pieces.commit(claim) }
     if (outcome == CommitOutcome.CORRUPT) {
@@ -512,6 +528,7 @@ internal class WebSeedWorker<P : WebSeedPiece>(
     }
     run[piece] = null
     withContext(NonCancellable) { pieces.release(claim, verified) }
+    return verified
   }
 
   /** This seed among the task's live connections, while it fetches. */

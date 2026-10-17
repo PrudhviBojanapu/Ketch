@@ -97,7 +97,7 @@ internal class TorrentV2WebSeeds private constructor(
   private val reporter: ConnectionReporter,
   private val logLabel: String,
   private val retryMs: Long,
-  /** Counts and rate-limits payload, as for peers. */
+  /** Counts payload as received, then rate-limits it, as for peers. */
   private val downloadPayload: suspend (Int) -> Unit,
 ) {
   private val log = KetchLogger("TorrentWebSeed")
@@ -128,7 +128,7 @@ internal class TorrentV2WebSeeds private constructor(
   // One worker per seed for the whole transfer: started again, a seed keeps what it learned.
   private val workers = urls.indices.map { seed ->
     WebSeedWorker(urls[seed], Pieces(seed), http, stats, logLabel, reporter, retryMs,
-      downloadPayload = downloadPayload)
+      downloadPayload = downloadPayload, discardPayload = store::recordDiscarded)
   }
 
   // Seeds started again after they stopped, which [run] launches.
