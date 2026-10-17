@@ -87,6 +87,11 @@ internal class TorrentPieceScheduler(
   private var sweptAt = 0L
   /** When each peer last looked for pieces to open and could not open all it wanted. */
   private val searches = mutableMapOf<Int, Search>()
+  // When each peer last looked for late blocks.
+  private val lateScans = mutableMapOf<Int, Long>()
+  // Wanted pieces no connected peer or seed has, and when they were counted ([sourceless]).
+  private var sourcelessCount = 0
+  private var sourcelessAt = Long.MIN_VALUE / 2
 
   /** Verified pieces in the order they verified, each once, for HAVEs ([poll]). */
   private var haveLog = IntArray(16)
@@ -137,6 +142,8 @@ internal class TorrentPieceScheduler(
     val blocks = (bytes.size + BLOCK - 1) / BLOCK
     /** Per block: [FREE], [RECEIVED], or the peer that asked for it. */
     val owner = IntArray(blocks) { FREE }
+    /** Per block asked for: when its first requester is late, so another may ask too. */
+    val dueAt = LongArray(blocks)
     /** Second requesters of blocks duplicated in the endgame. */
     var duplicates: MutableMap<Int, Int>? = null
     var free = blocks
@@ -190,6 +197,22 @@ internal class TorrentPieceScheduler(
     searches.remove(peer)
   }
 
+  /** Whether [peer] has a wanted piece that is not verified yet. */
+  suspend fun hasWanted(peer: Int): Boolean = mutex.withLock { (wantedFrom[peer] ?: 0) > 0 }
+
+  /** [peer] no longer has [indices]: a web seed that cannot serve them. */
+  suspend fun withdraw(peer: Int, indices: Collection<Int>): Unit = mutex.withLock {
+    val pieces = availability[peer] ?: return@withLock
+    for (index in indices) {
+      if (index !in 0 until pieceCount || !pieces[index]) continue
+      pieces[index] = false
+      rarity[index]--
+      held[peer] = (held[peer] ?: 1) - 1
+      if (wanted[index] && !verified[index]) wantedFrom[peer] = (wantedFrom[peer] ?: 1) - 1
+    }
+    searches.remove(peer)
+  }
+
   /**
    * Applies a single HAVE without rebuilding this peer's availability. A peer may announce
    * before any bitfield, and may repeat announcements, so absent state starts empty and a
@@ -211,33 +234,100 @@ internal class TorrentPieceScheduler(
 
   /**
    * Blocks for [peer] to ask for, at most [max] and only of pieces it has that [eligible]
-   * accepts: free blocks of open pieces first, then those of pieces it opens, rarest first; in the
-   * endgame, blocks other peers have outstanding.
+   * accepts: free blocks of open pieces first, then those of pieces it opens, rarest first, then
+   * blocks other peers are late with; in the endgame, any block other peers have outstanding.
+   * [lateAfterMs] is how long [peer] may take to deliver what it is handed before another peer
+   * may ask for it too.
    */
   suspend fun request(
     peer: Int,
     max: Int,
+    lateAfterMs: Long = DEFAULT_LATE_MS,
     eligible: (Int) -> Boolean = { true },
   ): Grant = mutex.withLock {
     val pieces = availability[peer] ?: return@withLock Grant(emptyList(), false)
     val requests = ArrayList<PeerMessage.Request>(minOf(max, 64))
     val now = nowMs()
+    val dueAt = now + lateAfterMs
     val iterator = withFree.iterator()
     while (requests.size < max && iterator.hasNext()) {
       val piece = iterator.next()
       if (!takes(piece, peer, pieces, eligible)) continue
-      take(piece, peer, max, requests, now)
+      take(piece, peer, max, requests, now, dueAt)
       if (piece.free == 0) iterator.remove()
     }
     var starved = false
     if (requests.size < max && searchDue(peer, now)) {
-      starved = openFor(peer, pieces, eligible, max, requests, now)
+      starved = openFor(peer, pieces, eligible, max, requests, now, dueAt)
       if (requests.size < max) searches[peer] = Search(openings, now)
     }
-    if (requests.size < max && unopened == 0) {
-      starved = endgame(peer, pieces, eligible, max, requests, now) || starved
+    // Pieces no connected peer or seed has cannot be opened: they never hold the endgame back.
+    if (requests.size < max && unopened <= sourceless(now)) {
+      starved = endgame(peer, pieces, eligible, max, requests, now, late = false) || starved
+    } else if (requests.size < max && lateScanDue(peer, now)) {
+      // An idle peer takes over blocks a slow one sits on, which also frees their buffers.
+      endgame(peer, pieces, eligible, max, requests, now, late = true)
     }
     Grant(requests, starved)
+  }
+
+  /**
+   * What a stalled swarm reports: [missingCount] wanted pieces no connected peer or running web
+   * seed has, the first [missing] of them, and [lateBlocks] requested blocks their peer is late
+   * with.
+   */
+  class Health(val missingCount: Int, val missing: IntArray, val lateBlocks: Int)
+
+  /**
+   * The swarm's [Health] now, naming at most [limit] missing pieces; with [among], only those of
+   * its pieces can be missing.
+   */
+  suspend fun health(limit: Int, among: Set<Int>? = null): Health = mutex.withLock {
+    val now = nowMs()
+    val missing = ArrayList<Int>()
+    var count = 0
+    for (index in among?.sorted() ?: (0 until pieceCount)) {
+      if (index !in 0 until pieceCount) continue
+      if (wanted[index] && !verified[index] && seedOwned[index] == 0 && rarity[index] == 0) {
+        count++
+        if (missing.size < limit) missing += index
+      }
+    }
+    var late = 0
+    for (piece in open.values) {
+      if (piece.committing) continue
+      for (block in 0 until piece.blocks) {
+        if (piece.owner[block] >= 0 && now >= piece.dueAt[block]) late++
+      }
+    }
+    Health(count, missing.toIntArray(), late)
+  }
+
+  /** Whether [peer] may look for late blocks now: at most every [LATE_SCAN_MS]. */
+  private fun lateScanDue(peer: Int, now: Long): Boolean {
+    val last = lateScans[peer]
+    if (last != null && now - last < LATE_SCAN_MS) return false
+    lateScans[peer] = now
+    return true
+  }
+
+  /**
+   * Wanted pieces nobody fetches that no connected peer or seed has, counted at most every
+   * [SOURCELESS_SCAN_MS]: while they are all that is left unopened, the endgame runs.
+   */
+  private fun sourceless(now: Long): Int {
+    if (unopened == 0) return 0
+    // Recounted once a second: peers come and go far less often than pieces open, and a piece
+    // nobody has never opens, so opening one leaves the count as it was.
+    if (now - sourcelessAt < SOURCELESS_SCAN_MS) return sourcelessCount
+    var count = 0
+    for (index in 0 until pieceCount) {
+      if (wanted[index] && !verified[index] && openPieces[index] == null &&
+        seedOwned[index] == 0 && rarity[index] == 0) count++
+    }
+    sourcelessCount = count
+    sourcelessAt = now
+    return count
   }
 
   /**
@@ -347,10 +437,12 @@ internal class TorrentPieceScheduler(
    */
   suspend fun claimRun(peer: Int, maxPieces: Int, maxBytes: Int): List<Claim> = mutex.withLock {
     check(peer !in claims)
+    // A seed has every piece but those it could not serve ([withdraw]).
+    val has = availability[peer]
     var first = -1
     for (index in 0 until pieceCount) {
       if (wanted[index] && !verified[index] && openPieces[index] == null &&
-        seedOwned[index] == 0) {
+        seedOwned[index] == 0 && has?.get(index) != false) {
         first = index
         break
       }
@@ -358,7 +450,7 @@ internal class TorrentPieceScheduler(
     if (first < 0 && remaining <= availability.size) {
       for (index in 0 until pieceCount) {
         val fetchers = seedOwned[index] + if (openPieces[index] != null) 1 else 0
-        if (wanted[index] && !verified[index] && fetchers < 2) {
+        if (wanted[index] && !verified[index] && fetchers < 2 && has?.get(index) != false) {
           first = index
           break
         }
@@ -375,7 +467,7 @@ internal class TorrentPieceScheduler(
     var index = first + 1
     while (run.size < minOf(maxPieces, share) && index < pieceCount) {
       if (!wanted[index] || verified[index] || openPieces[index] != null ||
-        seedOwned[index] > 0) break
+        seedOwned[index] > 0 || has?.get(index) == false) break
       val size = pieceSize(index)
       if (bytes + size > maxBytes ||
         budget.capacity - budget.allocated - size < budget.capacity / 2) break
@@ -472,6 +564,7 @@ internal class TorrentPieceScheduler(
     held.remove(peer)
     cancels.remove(peer)
     searches.remove(peer)
+    lateScans.remove(peer)
     for (piece in open.values.toList()) {
       if (!piece.committing && piece.outstanding == 0 &&
         availability.values.none { it[piece.index] }) close(piece)
@@ -502,12 +595,14 @@ internal class TorrentPieceScheduler(
     max: Int,
     requests: MutableList<PeerMessage.Request>,
     now: Long,
+    dueAt: Long,
   ) {
     if (piece.single == UNASSIGNED) piece.single = peer
     var block = piece.cursor
     while (block < piece.blocks && requests.size < max) {
       if (piece.owner[block] == FREE) {
         piece.owner[block] = peer
+        piece.dueAt[block] = dueAt
         piece.free--
         requests += piece.request(block)
       }
@@ -534,6 +629,7 @@ internal class TorrentPieceScheduler(
     max: Int,
     requests: MutableList<PeerMessage.Request>,
     now: Long,
+    dueAt: Long,
   ): Boolean {
     val wantedPieces = (max - requests.size + blocksPerPiece - 1) / blocksPerPiece
     // One pass counts candidates per rarity, so the pieces to open are found without sorting.
@@ -562,7 +658,7 @@ internal class TorrentPieceScheduler(
     for (index in order) {
       if (requests.size >= max) break
       val piece = openPiece(index, now) ?: return true
-      take(piece, peer, max, requests, now)
+      take(piece, peer, max, requests, now, dueAt)
       if (piece.free > 0) withFree += piece
     }
     return false
@@ -610,6 +706,7 @@ internal class TorrentPieceScheduler(
     max: Int,
     requests: MutableList<PeerMessage.Request>,
     now: Long,
+    late: Boolean,
   ): Boolean {
     for (piece in open.values) {
       if (requests.size >= max) break
@@ -618,20 +715,22 @@ internal class TorrentPieceScheduler(
       for (block in 0 until piece.blocks) {
         if (requests.size >= max) break
         val owner = piece.owner[block]
-        if (owner < 0 || owner == peer) continue
+        if (owner < 0 || owner == peer || late && now < piece.dueAt[block]) continue
+        if (piece.duplicates?.containsKey(block) == true) continue
         val duplicates = piece.duplicates ?: mutableMapOf<Int, Int>().also { piece.duplicates = it }
-        if (block in duplicates) continue
         duplicates[block] = peer
         requests += piece.request(block)
         piece.activeAt = now
       }
     }
+    // Outside the endgame, only late blocks: pieces web seeds fetch alone wait for it.
+    if (late) return false
     for (index in 0 until pieceCount) {
       if (requests.size >= max) break
       if (!wanted[index] || verified[index] || openPieces[index] != null ||
         seedOwned[index] != 1 || !pieces[index] || !eligible(index)) continue
       val piece = openPiece(index, now) ?: return true
-      take(piece, peer, max, requests, now)
+      take(piece, peer, max, requests, now, now + DEFAULT_LATE_MS)
       if (piece.free > 0) withFree += piece
     }
     return false
@@ -646,6 +745,7 @@ internal class TorrentPieceScheduler(
     if (piece.owner[block] == peer) {
       if (second != null) {
         piece.owner[block] = second
+        piece.dueAt[block] = nowMs() + DEFAULT_LATE_MS
         piece.duplicates?.remove(block)
       } else {
         piece.owner[block] = FREE
@@ -738,23 +838,32 @@ internal class TorrentPieceScheduler(
     }
   }
 
-  private companion object {
-    const val BLOCK = PeerWire.BLOCK_SIZE
-    const val FREE = -1
-    const val RECEIVED = -2
-    const val ANYONE = -1
-    const val UNASSIGNED = -2
+  internal companion object {
+    private const val BLOCK = PeerWire.BLOCK_SIZE
+    private const val FREE = -1
+    private const val RECEIVED = -2
+    private const val ANYONE = -1
+    private const val UNASSIGNED = -2
+
+    /** How long a peer may take to deliver a block before another may ask for it too. */
+    const val DEFAULT_LATE_MS = 6_000L
+
+    /** How often a peer looks for blocks others are late with. */
+    private const val LATE_SCAN_MS = 500L
+
+    /** How often pieces nobody has are counted again. */
+    private const val SOURCELESS_SCAN_MS = 1_000L
 
     /** How long a peer that found nothing to open waits before looking again unprompted. */
-    const val RESEARCH_MS = 250L
+    private const val RESEARCH_MS = 250L
 
     /** A partial piece nobody fetched from this long gives its buffer to a piece that needs it. */
-    const val STALE_PIECE_MS = 10_000L
+    private const val STALE_PIECE_MS = 10_000L
 
     /** A partial piece nobody fetched from this long gives its buffer up in any case. */
-    const val ABANDONED_PIECE_MS = 60_000L
+    private const val ABANDONED_PIECE_MS = 60_000L
 
     /** How often [poll] looks for abandoned pieces. */
-    const val SWEEP_MS = 1_000L
+    private const val SWEEP_MS = 1_000L
   }
 }

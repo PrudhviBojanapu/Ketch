@@ -154,6 +154,22 @@ internal class TorrentPieceStore(
     return result
   }
 
+  /** The selected files holding bytes of any of [pieces], at most [limit] of them, in order. */
+  fun filesHolding(pieces: IntArray, limit: Int): List<Int> {
+    if (pieces.isEmpty()) return emptyList()
+    val sorted = pieces.sorted()
+    val files = mutableListOf<Int>()
+    for (file in selected.sorted()) {
+      val range = piecesOf(file)
+      if (range.isEmpty()) continue
+      // The first missing piece at or after the file's first one.
+      val at = sorted.binarySearch(range.first).let { if (it >= 0) it else -it - 1 }
+      if (at < sorted.size && sorted[at] <= range.last) files += file
+      if (files.size == limit) break
+    }
+    return files
+  }
+
   /** The pieces holding bytes of [file]; empty for an empty file. */
   private fun piecesOf(file: Int): IntRange {
     if (metadata.files[file].size == 0L) return IntRange.EMPTY
@@ -628,6 +644,31 @@ internal class TorrentPieceStore(
       }
       ownedFiles.clear()
       ownedDirectories.clear()
+    }
+  }
+
+  /**
+   * Deletes what this store keeps beside the payload, every payload file left as it is: the
+   * sidecar's checkpoint, ownership journal and pieces of skipped files, then the sidecar folder
+   * once empty. For a task removed with its files kept.
+   */
+  suspend fun forget() = mutex.withLock {
+    storageOperation {
+      val files = ownedFiles.toList().filter { it.first.parent == sidecar }
+        .sortedBy { it.first == journalPath }
+      for ((path, identity) in files) {
+        validateRegularPath(path)
+        if (torrentFileIdentity(path) == identity) fileSystem.delete(path, mustExist = false)
+        ownedFiles.remove(path)
+      }
+      val identity = ownedDirectories[sidecar]
+      validateParents(sidecar)
+      val directory = fileSystem.metadataOrNull(sidecar)?.isDirectory == true
+      if (directory && identity != null && torrentFileIdentity(sidecar) == identity &&
+        fileSystem.list(sidecar).isEmpty()) {
+        fileSystem.delete(sidecar)
+        ownedDirectories.remove(sidecar)
+      }
     }
   }
 

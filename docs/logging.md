@@ -132,7 +132,7 @@ Log messages keep the names of Ketch's API types and of exceptions, and the CLI 
 | A resume restarts from zero | `ETag mismatch`, `Last-Modified mismatch` or `Local file integrity check failed` |
 | A task stays queued | `[DownloadQueue]` lines showing the concurrency and per-host limits |
 | A magnet never resolves | `Fetching metadata for magnet` repeating, tracker announce failures and DHT contacts; at debug, `Metadata for magnet ... not found within` after each 2-minute round |
-| A torrent stays at 0% | The [swarm summary](#torrent-swarm-summaries): `discovered=0` points at trackers or DHT (`lsd=0` while a device on the LAN shares it: local discovery is off or multicast is blocked), `connected=0` at reachability, `corrupt>0` at bad peers, `webSeedFailures` at mirrors |
+| A torrent stays at 0% or 99% | The [swarm summary](#torrent-swarm-summaries), which ends with `stall:` and why once it stops making progress: `discovered=0` points at trackers or DHT (`lsd=0` while a device on the LAN shares it: local discovery is off or multicast is blocked), `connected=0` at reachability, `corrupt>0` at bad peers, `webSeedFailures` at mirrors |
 | A remote instance is offline | `[RemoteKetch] Connection to ... failed (attempt n)` or `rejected the API token` |
 
 Task-scoped messages include `taskId=`, so you can follow one download with `grep`.
@@ -209,6 +209,14 @@ A v1 swarm that runs out of peers logs this at info. A v2 or hybrid swarm, which
 discovery, logs it at info each time every peer it tried is gone and none is left to dial, at most
 once per 30 seconds.
 
+A swarm that [stopped making progress](torrent.md#when-a-download-stops-making-progress) ends the
+line with `stall:` and why (`missing-pieces`, `no-peers`, `choked`, `slow-peers` or `unknown`), for
+how long, the missing pieces and the files they belong to, and the peers connected and unchoking
+it. Each change of reason logs one line at info (`stalled: …`, `makes progress again`, never once
+the download completed), as does each recovery it tries (`reannounce`, `revive_peers`,
+`relaunch_web_seeds`). `webSeedWasted` counts web seed payload thrown away: pieces that failed
+their hash check or that a failed request cut off, which never count as progress.
+
 ## Log format
 
 `Logger.console()` and the app log files write one record per call, prefixed with the local time,
@@ -255,9 +263,9 @@ Here `timeout=2m` is the length of one lookup round, not a limit on the whole lo
 Torrents with web seeds, v1 and v2 (summaries shortened with `...`):
 
 ```text
-[DEBUG] [TorrentSwarm] Swarm taskId=4f2a (89abcdef0123): pieces 300/512, peers connected=0 fast=0 active=0/100, queued=0, known=0, discovered=0, lsd=0, failed=0, corrupt=0, uploadSlots=0/4 interestedPeers=0 uploaded=0, discovery=open; ...; webSeeds=1/2 (dropped=1), webSeedPieces=300, webSeedPayload=314572800, webSeedFailures=5
+[DEBUG] [TorrentSwarm] Swarm taskId=4f2a (89abcdef0123): pieces 300/512, peers connected=0 fast=0 active=0/100, queued=0, known=0, discovered=0, lsd=0, failed=0, corrupt=0, uploadSlots=0/4 interestedPeers=0 uploaded=0, discovery=open; ...; webSeeds=1/2 (dropped=1), webSeedPieces=300, webSeedPayload=314572800, webSeedWasted=262144, webSeedFailures=5
 [INFO] [TorrentWebSeed] Transfer taskId=51d0 (v2 3991fc2074c5): downloading from 2 web seed(s) too
-[DEBUG] [TorrentSwarm] V2 swarm taskId=51d0 (3991fc2074c5): pieces 210/524, peers=0 (in=0, v1=0) ... pendingCommits=0; ...; webSeeds=2/2 (dropped=0), webSeedPieces=210, webSeedPayload=220200960, webSeedFailures=0
+[DEBUG] [TorrentSwarm] V2 swarm taskId=51d0 (3991fc2074c5): pieces 210/524, peers=0 (in=0, v1=0) ... pendingCommits=0; ...; webSeeds=2/2 (dropped=0), webSeedPieces=210, webSeedPayload=220200960, webSeedWasted=0, webSeedFailures=0
 ```
 
 A hybrid torrent seeding to two peers, one of them from its v1 swarm (`in` counts peers that dialed

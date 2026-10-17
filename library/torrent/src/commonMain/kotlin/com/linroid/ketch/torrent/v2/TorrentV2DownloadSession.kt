@@ -4,6 +4,7 @@ import com.linroid.ketch.api.log.KetchLogger
 import com.linroid.ketch.core.engine.ConnectionReporter
 import com.linroid.ketch.torrent.TorrentDiscoveryPrivacy
 import com.linroid.ketch.torrent.TorrentUploadPolicy
+import com.linroid.ketch.torrent.api.TorrentStall
 import com.linroid.ketch.torrent.describeWithoutUrls
 import com.linroid.ketch.torrent.engine.IncompleteSeedException
 import com.linroid.ketch.torrent.engine.TorrentBufferBudget
@@ -85,6 +86,8 @@ internal class TorrentV2Runtime(
    * `p`); zero leaves it out.
    */
   val listenPortFor: (PeerEndpoint) -> Int = { 0 },
+  /** Whether a peer is at our own public address, which the swarm never dials. */
+  val isOwnAddress: (PeerEndpoint) -> Boolean = { false },
   /** Test hook: peer exchange also shares and accepts loopback and private addresses. */
   val allowLocalPeers: Boolean = false,
   /**
@@ -128,6 +131,8 @@ internal class TorrentV2SessionOptions(
   val connections: ConnectionReporter = ConnectionReporter.None,
   /** The first backoff of a failed web seed; tests pass a short one. */
   val webSeedRetryMs: Long = WEB_SEED_RETRY_MS,
+  /** The clock the transfer's decisions follow, such as when a request is late; tests move it. */
+  val nowMs: () -> Long = monotonicClock(),
 )
 
 /** Discovery's only view of a session, valid for one transfer. */
@@ -146,6 +151,12 @@ internal interface TorrentV2DiscoverySink {
 
   fun uploadedBytes(): Long
   fun receivedBytes(): Long
+
+  /**
+   * How many times the transfer asked its trackers for peers now, as a stalled download does:
+   * discovery announces again, sooner than the trackers asked, whenever it grows.
+   */
+  fun reannounceRequests(): Long = 0
 }
 
 /**
@@ -189,13 +200,15 @@ internal class TorrentV2DownloadSession private constructor(
   private val memory = runtime.state
   private val maxPeers = options.maxPeers
   private val globalRate = runtime.downloadRate
-  private val throttle = options.throttle
+  /** The task's limits, which payload pays after the engine's and this owner's. */
+  private val taskThrottle = AtomicReference(options.throttle)
   private val discover = options.discovery
   private val privacy = options.privacy
   private val waitForPeers = options.waitForPeers
   private val seedOnly = options.seedOnly
   private val reporter = options.connections
   private val webSeedRetryMs = options.webSeedRetryMs
+  private val nowMs = options.nowMs
   private val fileIds: Set<String> = TorrentOutputMapping.from(document).files.mapTo(HashSet()) {
     it.id
   }
@@ -210,6 +223,14 @@ internal class TorrentV2DownloadSession private constructor(
   private val label = "taskId=${store.taskId} (v2 ${logHash(document.info.hash.hex)})"
 
   override val selectedFileIds: Set<String> get() = store.selectedIds()
+
+  private val mutableStall = MutableStateFlow<TorrentStall?>(null)
+
+  /** Why the running download makes no progress, while it does not; null once it stops. */
+  override val stall: StateFlow<TorrentStall?> get() = mutableStall
+
+  /** Raised each time a stalled transfer asks its trackers for peers; see [Sink]. */
+  private val reannounces = AtomicLong(0)
 
   /** One selection change at a time, handed to whichever transfer runs; see [changeSelection]. */
   private val selections = Channel<CompletableDeferred<Unit>>(1)
@@ -347,6 +368,8 @@ internal class TorrentV2DownloadSession private constructor(
   private val controls = AtomicReference<SendChannel<TorrentV2SessionLoop.Control>?>(null)
 
   override fun setDownloadRateLimit(bytesPerSecond: Long) = downloadRate.set(bytesPerSecond)
+
+  override fun setTaskThrottle(throttle: suspend (Int) -> Unit) = taskThrottle.store(throttle)
 
   /** This owner's upload bucket, applied after the engine's; zero means unlimited. */
   override fun setUploadRateLimit(bytesPerSecond: Long) = uploadRate.set(bytesPerSecond)
@@ -566,6 +589,8 @@ internal class TorrentV2DownloadSession private constructor(
     override fun uploadedBytes(): Long = store.uploadedBytes()
 
     override fun receivedBytes(): Long = store.receivedBytes()
+
+    override fun reannounceRequests(): Long = reannounces.load()
   }
 
   private suspend fun transfer() = coroutineScope {
@@ -578,7 +603,7 @@ internal class TorrentV2DownloadSession private constructor(
         charging = async(start = CoroutineStart.UNDISPATCHED) {
           // Charge each requested block before it can arrive, including retries/corrupt payload.
           // A pending limiter must not block peer control traffic, progress, or checkpoints.
-          throttle(missing)
+          taskThrottle.load()(missing)
           credits.update { it + missing }
         }
       }
@@ -607,12 +632,16 @@ internal class TorrentV2DownloadSession private constructor(
     val selecting = launch {
       for (done in selections) loopControls.send(TorrentV2SessionLoop.Control.Select(done))
     }
-    // Mirrors pay the same limits as peers: the engine's, this owner's, then the task's.
+    // Mirrors pay the same limits as peers: the engine's, this owner's, then the task's. The
+    // time they wait for them is no stall.
+    val webSeedThrottled = AtomicLong(0)
     val webSeeds = TorrentV2WebSeeds.of(document, layout, store, runtime.webSeedHttp, reporter,
       label, webSeedRetryMs) { bytes ->
+      val start = clock()
       globalRate.acquire(bytes)
       downloadRate.acquire(bytes)
-      throttle(bytes)
+      taskThrottle.load()(bytes)
+      webSeedThrottled.addAndFetch(clock() - start)
       store.recordReceived(bytes)
     }
     val mirrors = webSeeds?.let { launch { it.run() } }
@@ -667,7 +696,7 @@ internal class TorrentV2DownloadSession private constructor(
                 buffers, memory,
                 maxPeers = maxPeers, maxActive = activePieces(layout, buffers),
                 connections = dialer.connections, onProgress = ::updateProgress,
-                reporter = reporter,
+                nowMs = nowMs, reporter = reporter,
                 requestDelay = { bytes, admit ->
                   if (!admitted(bytes)) 50L else globalRate.requestDelay(bytes, downloadRate) {
                     admit().also { sent -> if (sent) credits.update { it - bytes } }
@@ -678,13 +707,17 @@ internal class TorrentV2DownloadSession private constructor(
                   serve = serve, sessionUploadRate = uploadRate, onCompleted = ::completed,
                   uploadedOverV1 = { v1Uploaded.addAndFetch(it.toLong()) },
                   onRoom = room::store, onIncomplete = ::incomplete,
-                  incomingFailures = incomingFailures, webSeeds = webSeeds))
+                  incomingFailures = incomingFailures, webSeeds = webSeeds,
+                  stall = mutableStall, reannounce = { reannounces.addAndFetch(1) },
+                  webSeedThrottledMs = webSeedThrottled::load))
             }
           }
         }
       }
     } finally {
       controls.compareAndSet(loopControls, null)
+      // A transfer that stopped is not stalled.
+      mutableStall.value = null
       withContext(NonCancellable) {
         try {
           charging?.cancelAndJoin()

@@ -6,6 +6,7 @@ import com.linroid.ketch.torrent.TorrentClient
 import com.linroid.ketch.torrent.TorrentDiscoveryPrivacy
 import com.linroid.ketch.torrent.TorrentDispatchers
 import com.linroid.ketch.torrent.TorrentUploadPolicy
+import com.linroid.ketch.torrent.api.TorrentStall
 import com.linroid.ketch.torrent.describeWithoutUrls
 import com.linroid.ketch.torrent.logHash
 import com.linroid.ketch.torrent.monotonicClock
@@ -22,6 +23,11 @@ import com.linroid.ketch.torrent.tracker.TrackerControl
 import com.linroid.ketch.torrent.tracker.TrackerRevisionConflict
 import com.linroid.ketch.torrent.tracker.TrackerStatus
 import com.linroid.ketch.torrent.v1.TorrentSwarm
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.AtomicLong
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -42,11 +48,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlin.concurrent.atomics.AtomicInt
-import kotlin.concurrent.atomics.AtomicLong
-import kotlin.concurrent.atomics.AtomicReference
-import kotlin.concurrent.atomics.ExperimentalAtomicApi
-import kotlin.coroutines.cancellation.CancellationException
 
 /** One task owns this session, its lifecycle job, output, and checkpoint. Network/runtime are borrowed. */
 @OptIn(ExperimentalAtomicApi::class)
@@ -58,12 +59,17 @@ internal class KotlinTorrentSession(
   connections: Int = 20,
   /** The part of [budget] pieces read back for peers may hold, every session's together. */
   private val uploadBudget: TorrentBufferBudget = budget,
+  /** What connected peers' wire frames and availability hold, every session's together. */
+  private val peerBudget: TorrentBufferBudget = budget,
   /** Read live: peers follow a change within a tick, and a seed finishes once it leaves SEED. */
   private val uploadPolicy: () -> TorrentUploadPolicy = { TorrentUploadPolicy.DISABLED },
   private val checkpoint: TorrentCheckpoint? = null,
   private val peerId: ByteArray = TorrentClient.peerId(),
   private val discover: suspend (SendChannel<PeerEndpoint>, KotlinTorrentSession) -> Unit,
+  /** The engine's download limits, which payload pays after this torrent's. */
   private val downloadThrottle: suspend (Int) -> Unit = {},
+  /** The task's limits, paid last; [setTaskThrottle] replaces them. */
+  taskThrottle: suspend (Int) -> Unit = {},
   /** The engine's upload bucket, shared by every torrent and applied before this one's. */
   private val engineUploadRate: TorrentRateLimiter = TorrentRateLimiter(),
   private val trackerConfigurationBudget: TorrentBufferBudget? = null,
@@ -72,6 +78,8 @@ internal class KotlinTorrentSession(
   private val allowLocalPeers: Boolean = false,
   /** Our listen port as a peer at that address reaches it (BEP 10 `p`); 0 leaves it out. */
   private val listenPortFor: (PeerEndpoint) -> Int = { 0 },
+  /** Whether a peer is at our own public address, which the swarm never dials. */
+  private val isOwnAddress: (PeerEndpoint) -> Boolean = { false },
   /**
    * Only seed: when the file check finds the selection incomplete, stop with
    * [IncompleteSeedException] before any discovery instead of downloading.
@@ -243,6 +251,7 @@ internal class KotlinTorrentSession(
 
   private val rate = TorrentRateLimiter()
   private val uploadRate = TorrentRateLimiter()
+  private val taskThrottle = AtomicReference(taskThrottle)
   private val connectionLimit = AtomicInt(connections)
   private val received = AtomicLong(checkpoint?.receivedBytes ?: 0)
   /** Peers local service discovery found, for the swarm summary. */
@@ -271,6 +280,9 @@ internal class KotlinTorrentSession(
   override val totalBytes: Long get() = store.totalSelectedBytes
   override val downloadedBytes: StateFlow<Long> get() = _downloadedBytes
   override val state: StateFlow<TorrentSessionState> get() = _state
+
+  private val _stall = MutableStateFlow<TorrentStall?>(null)
+  override val stall: StateFlow<TorrentStall?> get() = _stall
   val failure: StateFlow<Throwable?> get() = _failure
   val receivedBytes: Long get() = received.load()
   val uploadedBytes: Long get() = uploaded.load()
@@ -430,9 +442,11 @@ internal class KotlinTorrentSession(
           try {
             TorrentSwarm(store, network, budget, peerId = peerId,
               connections = { connectionLimit.load() }, uploadBudget = uploadBudget,
+              peerBudget = peerBudget, stall = _stall, reannounce = { reannounceTrackers() },
               uploadPolicy = uploadPolicy,
               allowLocalPeers = allowLocalPeers, trackerOnly = trackerRestricted,
-              listenPortFor = listenPortFor, reporter = reporter, peerOutcomes = peerOutcomes,
+              listenPortFor = listenPortFor, isOwnAddress = isOwnAddress, reporter = reporter,
+              peerOutcomes = peerOutcomes,
               dhtPortFor = dhtPortFor, onDhtNode = onDhtNode, onUtpPeers = onUtpPeers,
               utpEnabled = utpEnabled, webSeedHttp = webSeedHttp,
               localPeers = { localPeers.load() },
@@ -449,6 +463,7 @@ internal class KotlinTorrentSession(
                 }
                 rate.acquire(bytes)
                 downloadThrottle(bytes)
+                taskThrottle.load()(bytes)
               },
               uploadRate = engineUploadRate, sessionUploadRate = uploadRate,
               onUploaded = ::countUploaded,
@@ -477,6 +492,7 @@ internal class KotlinTorrentSession(
               log.i { "Torrent $label stopped seeding: upload policy changed" }
             }
           } finally {
+            _stall.value = null
             withContext(NonCancellable) { discovery.cancelAndJoin(); peers.cancel() }
           }
         }
@@ -581,6 +597,8 @@ internal class KotlinTorrentSession(
   }
 
   override fun setDownloadRateLimit(bytesPerSecond: Long) = rate.set(bytesPerSecond)
+
+  override fun setTaskThrottle(throttle: suspend (Int) -> Unit) = taskThrottle.store(throttle)
 
   override fun setUploadRateLimit(bytesPerSecond: Long) = uploadRate.set(bytesPerSecond)
 
