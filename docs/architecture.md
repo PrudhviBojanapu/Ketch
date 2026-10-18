@@ -21,6 +21,7 @@ dependencies:
 | `library:ftp` | FTP/FTPS `DownloadSource` | Android, iOS, JVM |
 | `library:hls` | Finite HLS `DownloadSource` | Android, iOS, JVM, JS (Node.js), WasmWasi |
 | `library:dash` | Finite DASH `DownloadSource` | Android, iOS, JVM, JS (Node.js), WasmWasi |
+| `library:metalink` | Metalink `DownloadSource`: several mirrors at once ([details](metalink.md)) | Android, iOS, JVM, JS (Node.js), WasmWasi |
 | `library:webdav` | WebDAV `DownloadSource` ([details](webdav.md)) | Android, iOS, JVM, JS (Node.js), WasmWasi |
 | `library:torrent` | BitTorrent and magnet `DownloadSource` ([details](torrent.md)) | Android, iOS, JVM |
 | `library:kermit` | Optional [Kermit](https://github.com/touchlab/Kermit) logging integration | Android, iOS, JVM, JS, WasmJs |
@@ -54,6 +55,7 @@ library:api          (public interfaces and models; no protocol types)
   |      +--- library:ftp      (FTP/FTPS DownloadSource)
   |      +--- library:hls      (finite HLS DownloadSource)
   |      +--- library:dash     (finite DASH DownloadSource)
+  |      +--- library:metalink (Metalink DownloadSource over several mirrors)
   |      +--- library:webdav   (WebDAV DownloadSource)
   |      +--- library:torrent  (BitTorrent DownloadSource and controller; ktor, torrent-api)
   |      +--- library:server   (REST API + SSE daemon; endpoints, ktor, sqlite)

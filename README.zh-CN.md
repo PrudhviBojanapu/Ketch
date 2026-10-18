@@ -121,6 +121,8 @@ Ketch 将每个下载任务拆分为多个并行连接，并实时显示各连�
   保持做种的种子在 Ketch 重启后会继续做种。
 - **HLS（`.m3u8`）和 DASH（`.mpd`）** — 将有限时长的流按所选画质（默认最佳）保存为一个媒体文件，
   合并独立的音频轨道，并解密 AES-128 HLS（[支持范围与限制](docs/media.md)）。
+- **Metalink（`.meta4`、`.metalink`）** — 同时从 Metalink 列出的所有镜像下载。失败或发送
+  损坏分块的镜像会被剔除，文件会用 Metalink 的哈希校验（[详情](docs/metalink.md)）。
 - Ketch 可注册为系统中磁力链接和 `.torrent` 文件的打开方式，
   在浏览器或文件管理器中单击即可交给 Ketch。
 
@@ -233,7 +235,6 @@ docker run -d --name ketch --restart unless-stopped -e PUID=1000 -e PGID=1000 \
 
 - **v1.0.0 前的分发准备** — Windows 版本签名、macOS 版本签名与公证、在更多浏览器商店上架扩展，
   以及安装和更新流程验证（[计划](docs/plans/v1-distribution.md)）
-- **Metalink** — 同时从多个镜像下载，并校验校验和
 - **媒体提取** — 保存网页中的媒体内容
 - **资源嗅探** — 查找网页上可下载的文件
 - **更快的分段下载** — 先完成的连接接手较慢连接剩余的部分，避免等待最慢的连接

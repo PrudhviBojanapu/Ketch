@@ -123,6 +123,9 @@ the command line with `ketch update` ([how updates work](docs/updates.md)).
 - **HLS (`.m3u8`) and DASH (`.mpd`)** — Save finite streams as one media file, in the quality
   you choose (the best by default), with separate audio merged in and AES-128 HLS decrypted
   ([support and limits](docs/media.md)).
+- **Metalink (`.meta4`, `.metalink`)** — Download from every mirror a Metalink lists at once.
+  A mirror that fails or sends bad pieces is left out, and the file is checked against the
+  Metalink's hashes ([details](docs/metalink.md)).
 - Ketch can open magnet links and `.torrent` files for your system, so a click in the browser or
   the file manager lands in Ketch.
 
@@ -242,7 +245,6 @@ docker run -d --name ketch --restart unless-stopped -e PUID=1000 -e PGID=1000 \
 - **Distribution before v1.0.0** — Signed Windows releases, signed and notarized macOS releases,
   the extension in more browser stores and verified installation/update paths
   ([plan](docs/plans/v1-distribution.md))
-- **Metalink** — Downloads from several mirrors at once, with checksums
 - **Media extraction** — Save the media of web pages
 - **Resource sniffer** — Find the downloadable files on a web page
 - **Transfers between devices** — Send to and Move to carry what is already downloaded, so the
@@ -285,6 +287,7 @@ task.state.collect { println(it) }
 - [Browser extension](app/browser-extension/README.md) — Setup, capturing, permissions and
   privacy
 - [BitTorrent](docs/torrent.md) — Torrent and magnet support and its limits
+- [Metalink](docs/metalink.md) — Downloads from several mirrors, with piece and file checks
 - [Multiple networks](docs/multiple-networks.md) — Spreading downloads across network interfaces
 - [AI discovery](docs/ai-discovery.md) — Providers, keys, web search, page access, chats and history
 - [Automation hooks](docs/hooks.md) — Commands and webhooks run on download events

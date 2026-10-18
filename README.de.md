@@ -134,6 +134,9 @@ Versionen: die Desktop-App über Einstellungen → Über, die Kommandozeile mit 
 - **HLS (`.m3u8`) und DASH (`.mpd`)** — Speichere zeitlich begrenzte Streams als eine Mediendatei,
   in der gewählten Qualität (standardmäßig der besten), mit eingebundener separater Tonspur und
   entschlüsseltem AES-128-HLS ([Unterstützung und Grenzen](docs/media.md)).
+- **Metalink (`.meta4`, `.metalink`)** — Lädt von allen Spiegelservern eines Metalinks
+  gleichzeitig. Ein Spiegel, der ausfällt oder fehlerhafte Teile liefert, wird ausgelassen, und
+  die Datei wird mit den Prüfsummen des Metalinks geprüft ([Details](docs/metalink.md)).
 - Ketch kann Magnet-Links und `.torrent`-Dateien für dein System öffnen: Ein Klick im Browser oder
   Dateimanager führt direkt zu Ketch.
 
@@ -267,7 +270,6 @@ docker run -d --name ketch --restart unless-stopped -e PUID=1000 -e PGID=1000 \
 - **Verteilung vor v1.0.0** — Signierte Windows-Versionen, signierte und notarisierte
   macOS-Versionen, die Erweiterung in weiteren Browser-Stores und geprüfte Installations- und
   Updatewege ([Plan](docs/plans/v1-distribution.md))
-- **Metalink** — Downloads von mehreren Spiegelservern gleichzeitig, mit Prüfsummen
 - **Medienextraktion** — Medien von Webseiten speichern
 - **Ressourcensuche** — Herunterladbare Dateien auf einer Webseite finden
 - **Schnellere segmentierte Downloads** — Früher fertige Verbindungen übernehmen den Rest langsamer

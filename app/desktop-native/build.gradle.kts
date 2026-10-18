@@ -13,6 +13,7 @@ dependencies {
   implementation(projects.library.ktor)
   implementation(projects.library.hls)
   implementation(projects.library.dash)
+  implementation(projects.library.metalink)
   implementation(projects.library.webdav)
   implementation(compose.desktop.currentOs)
   implementation("dev.nucleusframework:nucleus.nucleus-application:2.5.0")

@@ -134,6 +134,9 @@ publiées ici : l'application via Réglages → À propos, la ligne de commande
 - **HLS (`.m3u8`) et DASH (`.mpd`)** — Enregistrez les flux de durée finie dans un seul fichier
   multimédia, dans la qualité choisie (la meilleure par défaut), avec la piste audio séparée
   fusionnée et le chiffrement HLS AES-128 déchiffré ([prise en charge et limites](docs/media.md)).
+- **Metalink (`.meta4`, `.metalink`)** — Télécharge à la fois depuis tous les miroirs d'un
+  Metalink. Un miroir qui échoue ou envoie des morceaux corrompus est écarté, et le fichier est
+  vérifié avec les sommes du Metalink ([détails](docs/metalink.md)).
 - Ketch peut ouvrir les liens magnet et les fichiers `.torrent` du système : un clic dans le
   navigateur ou le gestionnaire de fichiers les envoie à Ketch.
 
@@ -270,7 +273,6 @@ docker run -d --name ketch --restart unless-stopped -e PUID=1000 -e PGID=1000 \
 - **Distribution avant v1.0.0** — Versions Windows signées, versions macOS signées et notariées,
   l'extension dans d'autres boutiques de navigateurs et parcours d'installation et de mise à
   jour vérifiés ([plan](docs/plans/v1-distribution.md))
-- **Metalink** — Téléchargements depuis plusieurs miroirs à la fois, avec sommes de contrôle
 - **Extraction multimédia** — Enregistrer les médias des pages web
 - **Détection de ressources** — Trouver les fichiers téléchargeables d'une page web
 - **Téléchargements segmentés plus rapides** — Les connexions terminées reprennent ce qui reste

@@ -37,6 +37,7 @@ import com.linroid.ketch.engine.KtorHttpEngine
 import com.linroid.ketch.dash.DashDownloadSource
 import com.linroid.ketch.ftp.FtpDownloadSource
 import com.linroid.ketch.hls.HlsDownloadSource
+import com.linroid.ketch.metalink.MetalinkDownloadSource
 import com.linroid.ketch.sqlite.DriverFactory
 import com.linroid.ketch.sqlite.createSqliteTaskStore
 import com.linroid.ketch.torrent.TorrentConfig
@@ -236,7 +237,7 @@ private fun createInstanceManager(unreadableFiles: UnreadableFiles): InstanceMan
           additionalSources = listOf(
             FtpDownloadSource(), torrentSource,
             HlsDownloadSource(httpEngine), DashDownloadSource(httpEngine),
-            WebDavDownloadSource(httpEngine),
+            MetalinkDownloadSource(httpEngine), WebDavDownloadSource(httpEngine),
           ),
         )
       },

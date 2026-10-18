@@ -97,7 +97,8 @@ From here:
   from `sqlite` to resume them after a restart.
 - Add `FtpDownloadSource()` or `TorrentDownloadSource()` to `additionalSources` for FTP or
   BitTorrent, and `HlsDownloadSource(httpEngine)` or `DashDownloadSource(httpEngine)` for
-  [finite streaming media](media.md), and `WebDavDownloadSource(httpEngine)` for
+  [finite streaming media](media.md), `MetalinkDownloadSource(httpEngine)` for
+  [Metalink](metalink.md) mirrors and `WebDavDownloadSource(httpEngine)` for
   [WebDAV](webdav.md), sharing the engine you pass to `Ketch`.
 
 The [API reference](api.md) covers configuration, priorities and scheduling, speed limits,

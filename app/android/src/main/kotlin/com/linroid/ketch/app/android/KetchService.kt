@@ -59,6 +59,7 @@ import com.linroid.ketch.engine.withNetworkInterfaces
 import com.linroid.ketch.dash.DashDownloadSource
 import com.linroid.ketch.ftp.FtpDownloadSource
 import com.linroid.ketch.hls.HlsDownloadSource
+import com.linroid.ketch.metalink.MetalinkDownloadSource
 import com.linroid.ketch.server.KetchServer
 import com.linroid.ketch.server.systemProtectedDirectories
 import com.linroid.ketch.sqlite.DriverFactory
@@ -230,7 +231,7 @@ class KetchService : Service() {
             additionalSources = listOf(
               FtpDownloadSource(), torrentSource,
               HlsDownloadSource(httpEngine), DashDownloadSource(httpEngine),
-              WebDavDownloadSource(httpEngine),
+              MetalinkDownloadSource(httpEngine), WebDavDownloadSource(httpEngine),
             ),
             // Left out of backups, as it downloads again on request.
             countries = DbIpCountryDatabase(File(noBackupFilesDir, COUNTRY_DATABASE_FILE)),
