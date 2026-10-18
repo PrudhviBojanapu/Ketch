@@ -66,7 +66,7 @@ val logger = Logger.combine(Logger.console(LogLevel.DEBUG), myFileLogger)
 | Where | Default level | How to change it |
 |-------|---------------|------------------|
 | Desktop app | debug | `KETCH_LOG_LEVEL` = `verbose`, `debug`, `info`, `warn` or `error`; applies to the console and the log file |
-| CLI | info | `-v` or `--verbose` for debug, `--debug` for verbose |
+| CLI | info; warn for `ketch <url>`, `--list-files`, `update` and the commands on a running instance | `-v` or `--verbose` for debug, `--debug` for verbose |
 | Android and iOS apps | debug | — |
 | Web app | info | — (logs go to the browser's developer console) |
 
@@ -128,7 +128,7 @@ Log messages keep the names of Ketch's API types and of exceptions, and the CLI 
 
 | Symptom | What to look for |
 |---------|------------------|
-| A download fails | `Download failed for taskId=...` with its cause chain, and the `Retry n/m` lines before it |
+| A download fails | `Download failed for taskId=...` with its cause chain (a warning, or an error with its stack trace when the failure is unknown, the disk's or a source error a bug caused, such as one wrapping an `IndexOutOfBoundsException`), where `FailedRequest` names the HTTP request an error status or a transport failure came from and its URL after redirects, without its query, and the `Retry n/m` lines before it |
 | A resume restarts from zero | `ETag mismatch`, `Last-Modified mismatch` or `Local file integrity check failed` |
 | A task stays queued | `[DownloadQueue]` lines showing the concurrency and per-host limits |
 | A magnet never resolves | `Fetching metadata for magnet` repeating, tracker announce failures and DHT contacts; at debug, `Metadata for magnet ... not found within` after each 2-minute round |
@@ -142,7 +142,7 @@ Task-scoped messages include `taskId=`, so you can follow one download with `gre
 | Level | Use | Examples |
 |-------|-----|----------|
 | Verbose | Detailed diagnostics | Speed limiter waits, FTP commands, per-peer torrent events |
-| Debug | Internal operations | Server detection, segments, tracker announces, DHT, swarm summaries |
+| Debug | Internal operations | Server detection, segments, HTTP failures a retry may fix, tracker announces, DHT, swarm summaries |
 | Info | User-facing events | Download start, state changes, completion, torrent lifecycle |
 | Warn | Recoverable problems | Retries, changed server files, corrupt torrent pieces |
 | Error | Failures | A download giving up, an engine that cannot start |
@@ -215,7 +215,8 @@ line with `stall:` and why (`missing-pieces`, `no-peers`, `choked`, `slow-peers`
 how long, the missing pieces and the files they belong to, and the peers connected and unchoking
 it. Each change of reason logs one line at info (`stalled: …`, `makes progress again`, never once
 the download completed), as does each recovery it tries (`reannounce`, `revive_peers`,
-`relaunch_web_seeds`). `webSeedWasted` counts web seed payload thrown away: pieces that failed
+`relaunch_web_seeds`). `ketch <url>` logs them only with `-v`; its output says why
+meanwhile. `webSeedWasted` counts web seed payload thrown away: pieces that failed
 their hash check or that a failed request cut off, which never count as progress.
 
 ## Log format
@@ -239,7 +240,7 @@ An HTTP download that survives one dropped connection:
 14:03:12.522 [INFO] [Execution] Resolved taskId=3f2a: source=http, totalBytes=10485760, outputPath=/Users/me/Downloads/file.zip
 14:03:12.524 [INFO] [HttpSource] Server supports ranges. Using 4 connections for taskId=3f2a, totalBytes=10485760
 14:03:12.530 [INFO] [Ketch] Task state: taskId=3f2a, Queued -> Downloading
-14:03:17.001 [WARN] [Execution] Retry 1/3 for taskId=3f2a in 1000ms: Network: Network error occurred <- IOException: Connection reset by peer
+14:03:17.001 [WARN] [Execution] Retry 1/3 for taskId=3f2a in 1000ms: Network: Network error occurred <- FailedRequest: GET https://example.com/file.zip <- IOException: Connection reset by peer
 14:03:25.870 [INFO] [Execution] Download completed for taskId=3f2a
 14:03:25.871 [INFO] [Ketch] Task state: taskId=3f2a, Downloading -> Completed(/Users/me/Downloads/file.zip, totalBytes=10485760, downloadTime=13.348s)
 ```

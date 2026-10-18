@@ -8,6 +8,7 @@ import com.linroid.ketch.api.DownloadSchedule
 import com.linroid.ketch.api.DownloadState
 import com.linroid.ketch.api.Segment
 import com.linroid.ketch.api.DownloadConfig
+import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.core.KetchDispatchers
 import com.linroid.ketch.core.engine.DownloadCoordinator
 import com.linroid.ketch.core.engine.DownloadQueue
@@ -352,6 +353,27 @@ class DownloadSchedulerTest {
       } finally {
         scope.cancel()
       }
+    }
+  }
+
+  @Test
+  fun reschedule_endedTask_keepsItsStateAndWaitsForNothing() = runTest {
+    val (_, manager) = createTestComponents(backgroundScope)
+    val ended = listOf(
+      DownloadState.Canceled to TaskState.CANCELED,
+      DownloadState.Completed("/tmp/file.zip", 1000) to TaskState.COMPLETED,
+      DownloadState.Failed(KetchError.Network()) to TaskState.FAILED,
+    )
+    for ((state, saved) in ended) {
+      val handle = createHandle("task-$saved")
+      handle.mutableState.value = state
+      handle.record.update { it.copy(state = saved) }
+
+      manager.reschedule(handle, DownloadSchedule.AfterDelay(10.seconds), emptyList())
+
+      assertEquals(state, handle.mutableState.value)
+      assertEquals(saved, handle.record.value.state)
+      assertFalse(manager.isScheduled(handle.taskId), "$saved")
     }
   }
 

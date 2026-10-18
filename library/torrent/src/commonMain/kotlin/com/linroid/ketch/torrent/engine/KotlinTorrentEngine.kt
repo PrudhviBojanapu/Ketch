@@ -21,8 +21,10 @@ import com.linroid.ketch.torrent.logHash
 import com.linroid.ketch.torrent.lsd.LsdTopic
 import com.linroid.ketch.torrent.lsd.LsdTransport
 import com.linroid.ketch.torrent.lsd.TorrentLocalDiscovery
+import com.linroid.ketch.torrent.magnet.ABANDONED_LOOKUP_GRACE
 import com.linroid.ketch.torrent.magnet.MAX_METADATA_PEERS
 import com.linroid.ketch.torrent.magnet.AnsweringPeers
+import com.linroid.ketch.torrent.magnet.LookupSources
 import com.linroid.ketch.torrent.magnet.METADATA_IDLE_MS
 import com.linroid.ketch.torrent.magnet.MagnetUri
 import com.linroid.ketch.torrent.magnet.MetadataLookupPeers
@@ -72,6 +74,7 @@ import com.linroid.ketch.torrent.storage.TorrentCheckpoint
 import com.linroid.ketch.torrent.storage.TorrentPieceStore
 import com.linroid.ketch.torrent.storage.TorrentV2Checkpoint
 import com.linroid.ketch.torrent.storage.TorrentV2PieceStore
+import com.linroid.ketch.torrent.storage.torrentFileSystem
 import com.linroid.ketch.torrent.storage.torrentSystemFileSystem
 import com.linroid.ketch.torrent.tracker.PrivateTrackerGroup
 import com.linroid.ketch.torrent.tracker.TRACKER_SCRAPE_WORKSPACE_BYTES
@@ -114,6 +117,8 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
@@ -124,6 +129,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import okio.FileSystem
 import okio.Path
 import okio.Path.Companion.toPath
 import kotlin.concurrent.atomics.AtomicBoolean
@@ -131,6 +137,7 @@ import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.concurrent.atomics.incrementAndFetch
+import kotlin.concurrent.atomics.update
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
@@ -214,6 +221,10 @@ internal class KotlinTorrentEngine(
   multicastLock: TorrentMulticastLock? = null,
   /** Test hook: how long one magnet metadata lookup runs. */
   private val magnetLookupTime: Duration = MAGNET_LOOKUP_TIME,
+  /** Test hook: how long a magnet metadata lookup goes on once nothing waits for it. */
+  magnetLookupGrace: Duration = ABANDONED_LOOKUP_GRACE,
+  /** Test hook: the file system v1 stores keep their payload in. */
+  private val payloadFileSystem: FileSystem = torrentFileSystem,
 ) : TorrentEngine {
   private class RuntimeContext : AbstractCoroutineContextElement(Key) {
     companion object Key : CoroutineContext.Key<RuntimeContext>
@@ -225,6 +236,13 @@ internal class KotlinTorrentEngine(
   private val scope = CoroutineScope(SupervisorJob() + TorrentDispatchers.engine + runtimeContext +
     CoroutineExceptionHandler { _, error -> log.e(error) { "Torrent background task failed" } })
   private val shutdown = AtomicReference<Deferred<Unit>?>(null)
+  /** The `stopped` announces of torrents that stopped ([sayGoodbye]). */
+  private val goodbyes = SupervisorJob(checkNotNull(scope.coroutineContext[Job]))
+  /** Those of [goodbyes] still on their way, by the topic they stop. */
+  private val farewells = AtomicReference(emptyMap<TrackerTopic, Set<Job>>())
+  /** Runs the v2 magnet lookups ([fetchV2Metadata]); btih ones run in [cache]. */
+  private val v2Lookups = CoroutineScope(scope.coroutineContext +
+    SupervisorJob(checkNotNull(scope.coroutineContext[Job])))
   /** Sockets to the local router, outside the peer budget and encryption. */
   private val directNetwork = rawNetwork
   private var portMapper: TorrentPortMapper? = null
@@ -284,7 +302,9 @@ internal class KotlinTorrentEngine(
   // Peers that sent a found torrent's metadata, which its download dials first.
   private val lookupPeers = MetadataLookupPeers()
   private val cache = TorrentMetadataCache(scope, config.maxCachedMetadataBytes,
-    exchangeBudgets.cache)
+    exchangeBudgets.cache, magnetLookupGrace)
+  /** Magnet metadata lookups running, those nothing waits for in their grace too; for tests. */
+  internal val pendingMetadataLookups: Int get() = cache.pendingFetches
   private val tracker = TorrentTracker(http, network)
   // One peer ID for every peer, tracker and metadata lookup (BEP 20), as private trackers check.
   private val peerId = TorrentClient.peerId()
@@ -574,7 +594,15 @@ internal class KotlinTorrentEngine(
               log.w { "Torrent $hash did not close while stopping: ${e.describeWithoutUrls()}" }
             }
           }
+          // Magnet lookups end beside them, those in their grace too, so a tracker-only one's
+          // `stopped` has the window as well.
+          launch { cache.close() }
+          launch { v2Lookups.coroutineContext.job.cancelAndJoin() }
         }
+        // Their `stopped` announces, and those of torrents that stopped before, have what is
+        // left of the window.
+        goodbyes.complete()
+        withTimeoutOrNull(stoppedAnnounceTime()) { goodbyes.join() }
         // Meanwhile, since the window opened, the router forgot our ports rather than forward
         // them to whoever gets this address.
         portMappingRemoval.join()
@@ -613,6 +641,43 @@ internal class KotlinTorrentEngine(
   private fun stoppedAnnounceTime(): Duration =
     stoppedDeadline.load()?.let { -it.elapsedNow() } ?: STOPPED_ANNOUNCE_TIME
 
+  /**
+   * Sends a stopped torrent's, or magnet lookup's, `stopped` announces ([announce]) from the
+   * engine, within [stoppedAnnounceTime] from now, rather than hold up what stopped it: a task
+   * canceled, paused or removed stops at once, whatever its trackers. Callers read what the
+   * announces report first, as the torrent's files may be gone by then. [stopRuntime] waits for
+   * them within the stopped window, and the next announces of [topics] that start the torrent
+   * again wait for them first ([awaitGoodbyes]).
+   */
+  private fun sayGoodbye(topics: Collection<TrackerTopic>, announce: suspend () -> Unit) {
+    val time = stoppedAnnounceTime()
+    val goodbye = scope.launch(goodbyes, start = CoroutineStart.LAZY) {
+      withTimeoutOrNull(time) { announce() }
+    }
+    farewells.update { current ->
+      current + topics.associateWith { current[it].orEmpty() + goodbye }
+    }
+    goodbye.invokeOnCompletion {
+      farewells.update { current ->
+        val left = topics.associateWith { current[it].orEmpty() - goodbye }
+        current - topics + left.filterValues { it.isNotEmpty() }
+      }
+    }
+    goodbye.start()
+  }
+
+  /**
+   * Waits for the `stopped` announces of [topics] still on their way ([sayGoodbye]), which end
+   * within the stopped window, so trackers hear a torrent stop before it starts again: a task
+   * paused and resumed, or retried, at once, or the download of a magnet whose lookup just said
+   * goodbye. Trackers that apply announces out of order would otherwise drop us from the swarm
+   * until our next regular announce.
+   */
+  private suspend fun awaitGoodbyes(topics: Collection<TrackerTopic>) {
+    val pending = farewells.load().filterKeys { it in topics }.values.flatten().distinct()
+    if (pending.isNotEmpty()) withTimeoutOrNull(STOPPED_ANNOUNCE_TIME) { pending.joinAll() }
+  }
+
   /** The key [lookupPeers] keeps a swarm's peers under: its wire tag. */
   private fun lookupTag(topic: TrackerTopic): String = topic.wireBytes().toByteString().hex()
 
@@ -635,7 +700,14 @@ internal class KotlinTorrentEngine(
       }
     } else emptyList()
     val hash = logHash(magnet.infoHash.hex)
-    val metadata = cache.resolve(magnet.infoHash, privacy) {
+    // A lookup in its grace carries on for this link only when it asks these too; tracker-only
+    // lookups ask their trackers' peers alone.
+    val sources = LookupSources(
+      TrackerConfiguration.usable(magnet.trackers.map { listOf(it) }).tiers.flatten().toSet(),
+      if (privacy == TorrentDiscoveryPrivacy.TRACKER_ONLY) emptySet()
+      else magnet.explicitPeers.toSet(),
+    )
+    val metadata = cache.resolve(magnet.infoHash, privacy, sources) {
       log.i {
         "Fetching metadata for magnet $hash: privacy=$privacy, trackers=${magnet.trackers.size}, " +
           "peers=${magnet.explicitPeers.size}, timeout=$magnetLookupTime"
@@ -695,7 +767,7 @@ internal class KotlinTorrentEngine(
     magnetUri: String,
     privacy: TorrentDiscoveryPrivacy,
   ): ByteArray {
-    val pending = scope.async { resolveV2Metadata(magnetUri, privacy) }
+    val pending = v2Lookups.async { resolveV2Metadata(magnetUri, privacy) }
     try { return pending.await() } finally {
       withContext(NonCancellable) { pending.cancelAndJoin() }
     }
@@ -766,6 +838,7 @@ internal class KotlinTorrentEngine(
         for (url in tiers.flatten().distinct()) {
           val trackerSet = TrackerTiers(listOf(listOf(url)), ::announceToTracker)
           var started = false
+          awaitGoodbyes(listOf(topic))
           try {
             val response = attempt { trackerSet.announce(TrackerAnnounce(topic, peerId,
               advertisedPort.current(), 0, 1, event = TrackerEvent.STARTED)) } ?: continue
@@ -786,11 +859,10 @@ internal class KotlinTorrentEngine(
               }
             }
           } finally {
-            if (started) withContext(NonCancellable) {
-              withTimeoutOrNull(stoppedAnnounceTime()) {
-                attempt { trackerSet.announce(TrackerAnnounce(topic, peerId,
-                  advertisedPort.current(), 0, 1, event = TrackerEvent.STOPPED)) }
-              }
+            // Said from the engine, so a lookup canceled or done returns at once.
+            if (started) sayGoodbye(listOf(topic)) {
+              attempt { trackerSet.announce(TrackerAnnounce(topic, peerId,
+                advertisedPort.current(), 0, 1, event = TrackerEvent.STOPPED)) }
             }
           }
         }
@@ -820,6 +892,7 @@ internal class KotlinTorrentEngine(
     progress: MetadataProgress,
   ): TorrentMetadata {
     val urls = trackerTiers.flatten().distinct()
+    val topic = TrackerTopic.V1(magnet.infoHash)
     val asked = HashSet<PeerEndpoint>()
     while (currentCoroutineContext().isActive) {
       var retrySeconds = 30L
@@ -828,6 +901,7 @@ internal class KotlinTorrentEngine(
         // Each connection closes before switching trackers, including unsuccessful peer sets.
         val tiers = TrackerTiers(listOf(listOf(url)), ::announceToTracker)
         var contacted = false
+        awaitGoodbyes(listOf(topic))
         try {
           val result = attempt {
             tiers.announce(TrackerAnnounce(magnet.infoHash, peerId, advertisedPort.current(), 0, 1,
@@ -853,12 +927,11 @@ internal class KotlinTorrentEngine(
             }
           }
         } finally {
-          if (contacted) withContext(NonCancellable) {
-            withTimeoutOrNull(stoppedAnnounceTime()) {
-              attempt {
-                tiers.announce(TrackerAnnounce(magnet.infoHash, peerId,
-                  advertisedPort.current(), 0, 1, event = TrackerEvent.STOPPED))
-              }
+          // Said from the engine, so a lookup canceled or done returns at once.
+          if (contacted) sayGoodbye(listOf(topic)) {
+            attempt {
+              tiers.announce(TrackerAnnounce(magnet.infoHash, peerId,
+                advertisedPort.current(), 0, 1, event = TrackerEvent.STOPPED))
             }
           }
         }
@@ -947,7 +1020,7 @@ internal class KotlinTorrentEngine(
       val requested = torrentSystemFileSystem.canonicalize(".".toPath())
         .resolve(spec.outputPath).normalized()
       val store = TorrentPieceStore(spec.metadata, requested, spec.selected, spec.taskId,
-        storageSlots = storageSlots)
+        fileSystem = payloadFileSystem, storageSlots = storageSlots, seedOnly = spec.seedOnly)
       val output = store.outputPath.toPath()
       requireAvailableOutput(output)
       val checkpoint = spec.resumeData?.let(TorrentCheckpoint::decode)
@@ -1192,12 +1265,12 @@ internal class KotlinTorrentEngine(
       TrackerDiscovery(document, layout, peerId, advertisedPort::current,
         TrackerTiers(urls, ::announceToTracker), onChanged,
         announceCompletion = store::selectsAll, topic = topic)
+    suspend fun announceState() =
+      AnnounceState(store.verifiedPieces(), sink.receivedBytes(), sink.uploadedBytes())
     suspend fun poll(
       discovery: TrackerDiscovery,
-      stopped: Boolean = false,
       manual: Boolean = false,
-    ): TrackerResponse? = discovery.poll(store.verifiedPieces(), sink.receivedBytes(),
-      sink.uploadedBytes(), stopped = stopped, manual = manual)
+    ): TrackerResponse? = announceState().poll(discovery, manual = manual)
     suspend fun publish(topic: TrackerTopic, peers: List<PeerEndpoint>) {
       // Admit the hosts first: a restricted owner accepts only peers its trackers name.
       sink.trackerPeers(topic, peers)
@@ -1207,6 +1280,7 @@ internal class KotlinTorrentEngine(
       // BEP 27: both hashes of a private hybrid use one tracker at a time, and move together.
       val group = PrivateTrackerGroup(topics, PrivateTrackerGroup.order(tiers),
         { topic, url -> discovery(topic, listOf(listOf(url))) {} }, sink::reset)
+      awaitGoodbyes(topics)
       try {
         while (isActive) {
           attempt {
@@ -1216,17 +1290,15 @@ internal class KotlinTorrentEngine(
           delay(1000)
         }
       } finally {
-        withContext(NonCancellable) {
-          withTimeoutOrNull(stoppedAnnounceTime()) {
-            attempt {
-              group.stop(store.verifiedPieces(), sink.receivedBytes(), sink.uploadedBytes())
-            }
-          }
+        val last = withContext(NonCancellable) { attempt { announceState() } }
+        if (last != null) sayGoodbye(topics) {
+          attempt { group.stop(last.verified, last.received, last.uploaded) }
         }
       }
     } else if (tiers.isNotEmpty()) for (topic in topics) launch {
       val discovery = discovery(topic, tiers, sink::reset)
       var reannounced = sink.reannounceRequests()
+      awaitGoodbyes(listOf(topic))
       try {
         while (isActive) {
           // A stalled transfer asks for peers now, sooner than the trackers said (as soon as
@@ -1240,11 +1312,10 @@ internal class KotlinTorrentEngine(
           delay(1000)
         }
       } finally {
-        withContext(NonCancellable) {
-          withTimeoutOrNull(stoppedAnnounceTime()) {
-            attempt { poll(discovery) }
-            attempt { poll(discovery, stopped = true) }
-          }
+        val last = withContext(NonCancellable) { attempt { announceState() } }
+        if (last != null) sayGoodbye(listOf(topic)) {
+          attempt { last.poll(discovery) }
+          attempt { last.poll(discovery, stopped = true) }
         }
       }
     }
@@ -1252,7 +1323,7 @@ internal class KotlinTorrentEngine(
       for (url in extraTrackers(tiers.flatten())) launch {
         // One coroutine per tracker polls the topics in turn, so a hybrid adds no sockets.
         announceExtra(topics.map { discovery(it, listOf(listOf(url))) {} },
-          { extra, stopped -> poll(extra, stopped) }) { extra, found ->
+          ::announceState) { extra, found ->
           found.forEach { sink.offer(it, peerTopic(extra.topic), PeerOrigin.TRACKER) }
         }
       }
@@ -1320,6 +1391,7 @@ internal class KotlinTorrentEngine(
         nowMs = nowMs,
         announceCompletion = session::selectsAllFiles,
       )
+      awaitGoodbyes(listOf(discovery.topic))
       discovery.observeStatus(session::updateTrackerStatus)
       try {
         TrackerControl.run(trackerState, operation = { manual ->
@@ -1348,16 +1420,12 @@ internal class KotlinTorrentEngine(
       } finally {
         discovery.observeStatus {}
         session.updateTrackerStatus(emptyList())
-        withContext(NonCancellable) {
-          withTimeoutOrNull(stoppedAnnounceTime()) {
-            if (session.state.value == TorrentSessionState.FINISHED ||
-              session.state.value == TorrentSessionState.SEEDING) {
-              attempt { discovery.poll(session.verifiedPieces(), session.receivedBytes,
-                session.uploadedBytes) }
-            }
-            attempt { discovery.poll(session.verifiedPieces(), session.receivedBytes,
-              session.uploadedBytes, stopped = true) }
-          }
+        val complete = session.state.value == TorrentSessionState.FINISHED ||
+          session.state.value == TorrentSessionState.SEEDING
+        val last = withContext(NonCancellable) { attempt { announceState(session) } }
+        if (last != null) sayGoodbye(listOf(discovery.topic)) {
+          if (complete) attempt { last.poll(discovery) }
+          attempt { last.poll(discovery, stopped = true) }
         }
       }
     }
@@ -1367,10 +1435,9 @@ internal class KotlinTorrentEngine(
           TrackerTiers(listOf(listOf(url)), ::announceToTracker), nowMs = nowMs,
           announceCompletion = session::selectsAllFiles,
         )
-        announceExtra(listOf(discovery), { topic, stopped ->
-          topic.poll(session.verifiedPieces(), session.receivedBytes, session.uploadedBytes,
-            stopped = stopped)
-        }) { _, found -> found.forEach { output.send(it) } }
+        announceExtra(listOf(discovery), { announceState(session) }) { _, found ->
+          found.forEach { output.send(it) }
+        }
       }
       magnetUri?.let { uri -> launch {
         MagnetUri.parse(uri).explicitPeers.forEach { text ->
@@ -1787,31 +1854,46 @@ internal class KotlinTorrentEngine(
 
   /**
    * Announces one extra tracker for each of [discoveries] (one per topic) until cancelled, then
-   * sends a best-effort stop to each within one shared bound. Each extra runs on its own because
-   * tier traversal stops at the first tracker that answers, and would otherwise wait behind every
-   * unreachable tracker of the torrent's own list. Topics are polled in sequence, so a torrent
-   * with two topics does not double the concurrent requests to a tracker.
+   * sends a best-effort stop to each within one shared bound ([sayGoodbye]). Each extra runs on
+   * its own because tier traversal stops at the first tracker that answers, and would otherwise
+   * wait behind every unreachable tracker of the torrent's own list. Topics are polled in
+   * sequence, so a torrent with two topics does not double the concurrent requests to a tracker.
    */
   private suspend fun announceExtra(
     discoveries: List<TrackerDiscovery>,
-    poll: suspend (TrackerDiscovery, stopped: Boolean) -> TrackerResponse?,
+    state: suspend () -> AnnounceState,
     publish: suspend (TrackerDiscovery, List<PeerEndpoint>) -> Unit,
   ) {
+    val topics = discoveries.map { it.topic }
+    awaitGoodbyes(topics)
     try {
       while (currentCoroutineContext().isActive) {
         for (discovery in discoveries) {
-          attempt { poll(discovery, false) }?.let { publish(discovery, it.peers.distinct()) }
+          attempt { state().poll(discovery) }?.let { publish(discovery, it.peers.distinct()) }
         }
         delay(1000)
       }
     } finally {
-      withContext(NonCancellable) {
-        withTimeoutOrNull(stoppedAnnounceTime()) {
-          for (discovery in discoveries) attempt { poll(discovery, true) }
-        }
+      val last = withContext(NonCancellable) { attempt { state() } }
+      if (last != null) sayGoodbye(topics) {
+        for (discovery in discoveries) attempt { last.poll(discovery, stopped = true) }
       }
     }
   }
+
+  /** What a v1 [session]'s announces report now. */
+  private suspend fun announceState(session: KotlinTorrentSession) =
+    AnnounceState(session.verifiedPieces(), session.receivedBytes, session.uploadedBytes)
+}
+
+/** What a torrent's announces report: its verified pieces and payload counters. */
+private class AnnounceState(val verified: BooleanArray, val received: Long, val uploaded: Long) {
+  suspend fun poll(
+    discovery: TrackerDiscovery,
+    stopped: Boolean = false,
+    manual: Boolean = false,
+  ): TrackerResponse? =
+    discovery.poll(verified, received, uploaded, stopped = stopped, manual = manual)
 }
 
 private const val WILDCARD_IPV4 = "0.0.0.0"

@@ -32,6 +32,7 @@ import io.ktor.http.URLBuilder
 import io.ktor.http.Url
 import io.ktor.http.content.ByteArrayContent
 import io.ktor.http.contentLength
+import io.ktor.http.hostWithPortIfSpecified
 import io.ktor.http.isSecure
 import io.ktor.http.isSuccess
 import io.ktor.http.takeFrom
@@ -75,7 +76,9 @@ class KtorHttpEngine private constructor(
   /**
    * @param client the Ktor HTTP client to use, or `null` for the engine's own clients, with
    *   infinite timeouts (suitable for large downloads)
-   * @param logRequests whether request URLs, response headers, and transport errors may be logged
+   * @param logRequests whether request URLs, response headers, and transport errors may be logged,
+   *   and whether its errors for HTTP error statuses and transport failures name the request that
+   *   failed, without its URL's query
    * @param userAgent the `User-Agent` of requests whose headers name none, [DEFAULT_USER_AGENT]
    *   by default; `null` leaves it to [client]
    */
@@ -222,7 +225,15 @@ class KtorHttpEngine private constructor(
             }
             receivedBytes += bytesRead
             val data = if (bytesRead == buffer.size) buffer else buffer.copyOf(bytesRead)
-            onData(data)
+            try {
+              onData(data)
+            } catch (e: CancellationException) {
+              throw e
+            } catch (e: KetchError) {
+              throw e
+            } catch (e: Exception) {
+              throw CallbackFailure(e)
+            }
           }
         }
         channel.closedCause?.let { throw it }
@@ -329,7 +340,11 @@ class KtorHttpEngine private constructor(
     return sendable + (HttpHeaders.UserAgent to agent)
   }
 
-  /** Runs [block], reporting transport failures as [KetchError.Network]. */
+  /**
+   * Runs [block], reporting transport failures as [KetchError.Network]. They are logged at debug
+   * level only: callers retry them, warning as they do, and report the failure they give up on,
+   * which names where it failed ([FailedRequest]).
+   */
   private inline fun <T> transport(block: () -> T): T {
     try {
       return block()
@@ -337,8 +352,12 @@ class KtorHttpEngine private constructor(
       throw e
     } catch (e: KetchError) {
       throw e
+    } catch (e: CallbackFailure) {
+      // The cause is what the caller's callback threw, which callers look for.
+      if (logRequests) log.d { "Network error: ${e.cause.describeCauses()}" }
+      throw KetchError.Network(e.cause)
     } catch (e: Exception) {
-      if (logRequests) log.e { "Network error: ${e.describeCauses()}" }
+      if (logRequests) log.d { "Network error: ${e.describeCauses()}" }
       throw KetchError.Network(e)
     }
   }
@@ -430,16 +449,30 @@ class KtorHttpEngine private constructor(
       "Sending ${method.value} for ${redactUrl(target.toString())} through ${routed.route}"
     }
     val observer = currentCoroutineContext()[HttpExchangeObserver]
-    return routed.client.prepareRequest {
-      this.method = method
-      url(target)
-      headers.forEach { (name, value) -> header(name, value) }
-      if (range != null) header(HttpHeaders.Range, "bytes=${range.first}-${range.last}")
-      if (body != null) setBody(ByteArrayContent(body.bytes, ContentType.parse(body.contentType)))
-    }.execute { response ->
-      // Every hop reports; the last one, the final target, is what the caller keeps.
-      observer?.onExchange(exchangeOf(response, routed.route))
-      onResponse(response)
+    return try {
+      routed.client.prepareRequest {
+        this.method = method
+        url(target)
+        headers.forEach { (name, value) -> header(name, value) }
+        if (range != null) header(HttpHeaders.Range, "bytes=${range.first}-${range.last}")
+        if (body != null) {
+          setBody(ByteArrayContent(body.bytes, ContentType.parse(body.contentType)))
+        }
+      }.execute { response ->
+        // Every hop reports; the last one, the final target, is what the caller keeps.
+        observer?.onExchange(exchangeOf(response, routed.route))
+        onResponse(response)
+      }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: KetchError) {
+      throw e
+    } catch (e: CallbackFailure) {
+      throw e
+    } catch (e: Exception) {
+      // Where it failed, also after redirects, for whoever reports the failure.
+      if (!logRequests) throw e
+      throw FailedRequest(method.value, target, e)
     }
   }
 
@@ -467,8 +500,11 @@ class KtorHttpEngine private constructor(
   }
 
   /**
-   * The error for a non-success [response], with the rate limit it reports on 429. Logged as an
-   * error when [fatal], else at debug level for callers that may still recover.
+   * The error for a non-success [response], with the rate limit it reports on 429, and the request
+   * it answered ([FailedRequest]) as its cause. Logged as an error naming the URL only when
+   * [fatal] and no retry can help, as for a 404; else at debug level, as callers may still recover
+   * from what is not [fatal], such as a refused HEAD, and retry 5xx and 429
+   * ([KetchError.isRetryable]), warning as they do and reporting the failure they give up on.
    */
   private fun httpError(
     method: String,
@@ -476,17 +512,22 @@ class KtorHttpEngine private constructor(
     fatal: Boolean = true,
   ): KetchError.Http {
     val status = response.status
+    val request = if (logRequests) FailedRequest(method, response.request.url) else null
+    val error = if (status.value != 429) {
+      KetchError.Http(status.value, status.description, cause = request)
+    } else {
+      val retryAfter = parseRetryAfter(response.headers[HttpHeaders.RetryAfter])
+        ?: findRateLimitReset(response.headers)
+      val remaining = findRateLimitRemaining(response.headers)
+      if (logRequests) log.d { "Rate limit headers: retryAfter=$retryAfter, remaining=$remaining" }
+      KetchError.Http(status.value, status.description, retryAfter, remaining, request)
+    }
     if (logRequests) {
       val message = "HTTP error ${status.value}: ${status.description} " +
         "for $method ${redactUrl(response.request.url.toString())}"
-      if (fatal) log.e { message } else log.d { message }
+      if (fatal && !error.isRetryable) log.e { message } else log.d { message }
     }
-    if (status.value != 429) return KetchError.Http(status.value, status.description)
-    val retryAfter = parseRetryAfter(response.headers[HttpHeaders.RetryAfter])
-      ?: findRateLimitReset(response.headers)
-    val remaining = findRateLimitRemaining(response.headers)
-    if (logRequests) log.d { "Rate limit headers: retryAfter=$retryAfter, remaining=$remaining" }
-    return KetchError.Http(status.value, status.description, retryAfter, remaining)
+    return error
   }
 
   /** How one request of a redirect chain ended. */
@@ -724,3 +765,24 @@ class KtorHttpEngine private constructor(
     }
   }
 }
+
+/**
+ * The request an HTTP error status or a transport failure of a [KtorHttpEngine] came from, the
+ * cause of its error: [method] and where it went, after redirects, as the scheme, host, port and
+ * path of its URL. The engine logs each attempt's failure at debug level only, so through it the
+ * failure a caller reports, such as a download that gives up retrying, says where it failed
+ * ([describeCauses]). Its user information and query are left out: they may hold credentials
+ * [redactUrl] does not know, such as the tokens of a signed link, and callers show the failure to
+ * users too, as an update's. The errors the engine raises itself on a response it refuses, such
+ * as one of another range or length or a redirect it will not follow, and after too many
+ * redirects name no request.
+ */
+internal class FailedRequest(method: String, url: Url, cause: Throwable? = null) :
+  Exception("$method ${url.originAndPath()}", cause)
+
+/** This URL's scheme, host, port and path, without its user information, query or fragment. */
+private fun Url.originAndPath(): String =
+  "${protocol.name}://$hostWithPortIfSpecified$encodedPath"
+
+/** What the caller's callback threw while a response was read, kept apart from the request's. */
+private class CallbackFailure(override val cause: Exception) : Exception(cause)

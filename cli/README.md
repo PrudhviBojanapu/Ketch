@@ -82,7 +82,9 @@ Run `ketch` with no arguments, or with `--help`, to print the usage. Every comma
 ### Global options
 
 These flags can go anywhere on the command line and apply to every command. Logs go to the
-console at info level by default; see [logging](../docs/logging.md) for what each level shows.
+console at info level by default, and only warnings and errors for downloads, `--list-files`,
+`update` and the commands that work on a running instance; see [logging](../docs/logging.md) for
+what each level shows.
 
 | Option | Effect |
 |---|---|
@@ -96,7 +98,8 @@ ketch [options] <url> [destination]
 ```
 
 Downloads one URL, prints its progress, and exits when it completes or fails, ending with
-`Download completed: <path>` or `Download failed: <reason>`. It handles:
+`Download completed: <path>` and status 0, or `Download failed: <reason>` on stderr and status 1,
+as when no source handles the link. It handles:
 
 - HTTP(S) URLs
 - FTP and FTPS URLs: `ftp://[user:password@]host[:port]/path`
@@ -115,6 +118,10 @@ Where the file goes:
 - Any other path, including a bare name such as `file.zip`, is the file path, relative to the
   current folder.
 - Torrents follow the [torrent destination rules](../docs/torrent.md).
+
+While a torrent makes no progress, its progress line says for how long (`stalled 2m 30s`), and a
+line above it says why each time the reason changes, such as `[Stalled] No peers, still looking`;
+see [stalls](../docs/torrent.md#when-a-download-stops-making-progress).
 
 The download is kept in memory only: it is not added to the [task database](#database), and the
 Ketch app does not see it. To add a download to the app or server instead, use

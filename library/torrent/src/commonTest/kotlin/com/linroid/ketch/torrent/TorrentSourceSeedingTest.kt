@@ -20,6 +20,7 @@ import com.linroid.ketch.torrent.control.UnusedHttpEngine
 import com.linroid.ketch.torrent.crypto.sha1Digest
 import com.linroid.ketch.torrent.crypto.torrentRandomBytes
 import com.linroid.ketch.torrent.engine.KotlinTorrentEngine
+import com.linroid.ketch.torrent.engine.KotlinTorrentSession
 import com.linroid.ketch.torrent.engine.TorrentBufferBudget
 import com.linroid.ketch.torrent.engine.TorrentRouteTable
 import com.linroid.ketch.torrent.engine.TorrentSessionState
@@ -34,6 +35,7 @@ import com.linroid.ketch.torrent.peer.PeerIdentityHandshake
 import com.linroid.ketch.torrent.peer.PeerMessage
 import com.linroid.ketch.torrent.peer.PeerTraffic
 import com.linroid.ketch.torrent.peer.PeerWire
+import com.linroid.ketch.torrent.peer.pieceBitfield
 import com.linroid.ketch.torrent.storage.torrentFileSystem
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -42,13 +44,20 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okio.ByteString.Companion.toByteString
+import okio.FileHandle
 import okio.FileSystem
+import okio.ForwardingFileSystem
 import okio.Path
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -811,6 +820,367 @@ class TorrentSourceSeedingTest {
     assertEquals(ids - dropped, source.sessionOf("seeder")?.selectedFileIds)
     source.stopSeeding("seeder")
     source.assertNoLeaks()
+  }
+
+  /**
+   * The payload file system, which holds the next read of the file [hold] names until the hold is
+   * released: a check of the files waits there, in the middle of the check.
+   */
+  @OptIn(ExperimentalAtomicApi::class)
+  private class HoldingFileSystem : ForwardingFileSystem(torrentFileSystem) {
+    class Hold(val name: String) {
+      val reached = CompletableDeferred<Unit>()
+      val released = CompletableDeferred<Unit>()
+    }
+
+    private val next = AtomicReference<Hold?>(null)
+
+    fun hold(name: String): Hold = Hold(name).also { next.store(it) }
+
+    override fun openReadOnly(file: Path): FileHandle {
+      val hold = next.load()
+      if (hold != null && file.name == hold.name && next.compareAndSet(hold, null)) {
+        hold.reached.complete(Unit)
+        // A storage thread blocked in its read, as one reading a slow disk is.
+        runBlocking { hold.released.await() }
+      }
+      return super.openReadOnly(file)
+    }
+  }
+
+  /**
+   * Runs [body] with a source whose engine seeds v1 tasks of [torrent], every file written into
+   * the output folder it is given, and checks that the source and the engine return everything.
+   * No file ends on a piece boundary: f1 shares its first piece with f0 and its last with f2.
+   * The engine's stores keep their payload in [payload].
+   */
+  private fun v1Seeding(
+    torrent: MultiFileTorrent,
+    payload: FileSystem = torrentFileSystem,
+    body: suspend CoroutineScope.(TorrentDownloadSource, () -> KotlinTorrentEngine, Path) -> Unit,
+  ) = runTest {
+    withContext(Dispatchers.Default) {
+      withTimeout(30_000) {
+        val root = (FileSystem.SYSTEM_TEMPORARY_DIRECTORY /
+          "ketch-source-seed-v1-${InfoHash.fromBytes(torrentRandomBytes(20)).hex}")
+          .also { torrentFileSystem.createDirectories(it) }
+        val output = root / "pack"
+        torrent.writeTo(output)
+        var engine: KotlinTorrentEngine? = null
+        val source = TorrentDownloadSource(TorrentConfig(dhtEnabled = false,
+          uploadPolicy = TorrentUploadPolicy.SEED_AFTER_COMPLETION)).also {
+          it.engineFactory = { config ->
+            KotlinTorrentEngine(config, listenHost = "127.0.0.1", payloadFileSystem = payload)
+              .also { created -> engine = created }
+          }
+        }
+        try {
+          body(source, { checkNotNull(engine) }, output)
+          source.assertNoLeaks()
+        } finally {
+          source.close()
+          engine?.stop()
+          torrentFileSystem.deleteRecursively(root, mustExist = false)
+        }
+        checkNotNull(engine).assertNoLeaks()
+      }
+    }
+  }
+
+  /**
+   * The completed task `seeder` of [torrent] at [output], restored with [selected] and the
+   * [state] its record holds: by default, what Ketch saved as it completed without a checkpoint.
+   */
+  private fun v1SeedingTask(
+    torrent: MultiFileTorrent,
+    output: Path,
+    selected: Set<String>,
+    state: SourceState? = null,
+  ) = SeedingTask("seeder", "http://fixture/pack.torrent",
+    state ?: TorrentSourceState(torrent.metadata.infoHash.hex, torrent.sizes.sum().toLong(), "",
+      selected, output.toString(), encodeBase64(torrent.metainfo), version = 2,
+      privacy = TorrentDiscoveryPrivacy.PUBLIC).saved(),
+    null, output.toString(), selected)
+
+  /** The latest state the source saves for a seeding task, as the task's record keeps it. */
+  private fun TorrentDownloadSource.savedStates(): MutableStateFlow<SourceState?> =
+    MutableStateFlow<SourceState?>(null).also { saved ->
+      saveSessionStates { _, state -> saved.value = state }
+    }
+
+  /**
+   * Rewrites the bytes [at] of [path] in place, as an editor would, late enough that the file's
+   * modification time tells the edit apart from the last write. Returns the edited bytes.
+   */
+  private suspend fun editInPlace(path: Path, vararg at: Int): ByteArray {
+    val bytes = torrentFileSystem.read(path) { readByteArray() }
+    for (index in at) bytes[index] = (bytes[index] + 1).toByte()
+    val before = torrentFileSystem.metadata(path).lastModifiedAtMillis
+    while (true) {
+      torrentFileSystem.write(path) { write(bytes) }
+      if (torrentFileSystem.metadata(path).lastModifiedAtMillis != before) return bytes
+      delay(5)
+    }
+  }
+
+  /**
+   * Connects to [engine] as a peer of [torrent] and asks for the first block of [piece], until
+   * [condition] holds.
+   */
+  private suspend fun requestPiece(
+    torrent: MultiFileTorrent,
+    engine: KotlinTorrentEngine,
+    piece: Int,
+    condition: suspend () -> Boolean,
+  ) {
+    val network = createTorrentNetwork()
+    try {
+      val connection = network.connect(PeerEndpoint("127.0.0.1", engine.listenPort))
+      try {
+        val wire = PeerWire(connection, torrent.metadata)
+        wire.handshake(PeerHandshake(torrent.metadata.infoHash, torrentRandomBytes(20), false,
+          false))
+        wire.send(PeerMessage.Control(PeerMessage.Signal.INTERESTED))
+        while (wire.read() != PeerMessage.Control(PeerMessage.Signal.UNCHOKE)) Unit
+        wire.send(PeerMessage.Request(piece, 0, 16_384))
+        eventually(condition)
+      } finally {
+        connection.close()
+      }
+    } finally {
+      network.close()
+    }
+  }
+
+  /** The bitfield the engine sends a peer that connects for [torrent]. */
+  private suspend fun advertised(
+    torrent: MultiFileTorrent,
+    engine: KotlinTorrentEngine,
+  ): ByteArray {
+    val network = createTorrentNetwork()
+    try {
+      val connection = network.connect(PeerEndpoint("127.0.0.1", engine.listenPort))
+      try {
+        val wire = PeerWire(connection, torrent.metadata)
+        wire.handshake(PeerHandshake(torrent.metadata.infoHash, torrentRandomBytes(20), false,
+          false))
+        return assertIs<PeerMessage.Bitfield>(wire.read()).bytes
+      } finally {
+        connection.close()
+      }
+    } finally {
+      network.close()
+    }
+  }
+
+  @Test
+  fun startSeeding_v1FileDeletedThenDropped_seedsWithoutTheSharedPieces() {
+    val torrent = MultiFileTorrent()
+    v1Seeding(torrent) { source, engine, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      // Deleted before anything kept a copy of the pieces it shares with f0 and f2.
+      torrentFileSystem.delete(output / "f1")
+
+      val outcome = source.startSeeding(v1SeedingTask(torrent, output, ids - "1"))
+
+      assertEquals(SeedingOutcome.SEEDING, outcome)
+      val shared = setOf(torrent.piecesOf(1).first, torrent.piecesOf(1).last)
+      val kept = (torrent.piecesOf(0) + torrent.piecesOf(2)).toSet() - shared
+      val pieces = BooleanArray(torrent.pieceCount) { it in kept }
+      assertContentEquals(pieceBitfield(pieces), advertised(torrent, engine()))
+      assertEquals(TorrentSessionState.SEEDING, source.sessionOf("seeder")?.state?.value)
+      source.stopSeeding("seeder")
+    }
+  }
+
+  /**
+   * Has the engine create f1 for the task, as a download would, then writes its bytes in place:
+   * the task owns f1 from then on, and seeds every file of [torrent] at [output].
+   */
+  private suspend fun TorrentDownloadSource.seedWithF1Owned(
+    torrent: MultiFileTorrent,
+    output: Path,
+    ids: Set<String>,
+  ) {
+    torrentFileSystem.delete(output / "f1")
+    assertEquals(SeedingOutcome.CHANGED_ON_DISK,
+      startSeeding(v1SeedingTask(torrent, output, ids)))
+    torrentFileSystem.write(output / "f1") { write(torrent.payloads[1]) }
+    assertEquals(SeedingOutcome.SEEDING, startSeeding(v1SeedingTask(torrent, output, ids)))
+  }
+
+  @Test
+  fun startSeeding_v1DroppedFileEdited_seedsWithoutTheSharedPiecesAndLeavesIt() {
+    val torrent = MultiFileTorrent()
+    v1Seeding(torrent) { source, engine, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      val saved = source.savedStates()
+      source.seedWithF1Owned(torrent, output, ids)
+      assertTrue(source.changeSeedingSelection("seeder", ids - "1"))
+      source.stopSeeding("seeder")
+      // The owner edits the file it dropped in place, as a tag editor would, at both ends.
+      val edited = editInPlace(output / "f1", 0, torrent.sizes[1] - 1)
+
+      val outcome = source.startSeeding(v1SeedingTask(torrent, output, ids - "1",
+        assertNotNull(saved.value)))
+
+      assertEquals(SeedingOutcome.SEEDING, outcome)
+      val shared = setOf(torrent.piecesOf(1).first, torrent.piecesOf(1).last)
+      val kept = (torrent.piecesOf(0) + torrent.piecesOf(2)).toSet() - shared
+      val pieces = BooleanArray(torrent.pieceCount) { it in kept }
+      assertContentEquals(pieceBitfield(pieces), advertised(torrent, engine()))
+      source.stopSeeding("seeder")
+      assertContentEquals(edited, torrentFileSystem.read(output / "f1") { readByteArray() })
+    }
+  }
+
+  @Test
+  fun startSeeding_v1ChosenFileEditedInASharedPiece_changedOnDisk() {
+    val torrent = MultiFileTorrent()
+    v1Seeding(torrent) { source, _, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      val saved = source.savedStates()
+      source.seedWithF1Owned(torrent, output, ids)
+      assertTrue(source.changeSeedingSelection("seeder", ids - "1"))
+      source.stopSeeding("seeder")
+      // The owner edits f0 where it shares a piece with f1, which is as the seeder left it.
+      val edited = editInPlace(output / "f0", torrent.sizes[0] - 1)
+
+      val outcome = source.startSeeding(v1SeedingTask(torrent, output, ids - "1",
+        assertNotNull(saved.value)))
+
+      assertEquals(SeedingOutcome.CHANGED_ON_DISK, outcome)
+      assertContentEquals(edited, torrentFileSystem.read(output / "f0") { readByteArray() })
+      assertContentEquals(torrent.payloads[1],
+        torrentFileSystem.read(output / "f1") { readByteArray() })
+    }
+  }
+
+  @Test
+  fun startSeeding_v1FileDroppedWhileItChecks_seedsWithoutTheSharedPieces() {
+    val torrent = MultiFileTorrent()
+    val payload = HoldingFileSystem()
+    v1Seeding(torrent, payload) { source, engine, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      // The owner deleted f1; a check of every file created it again, empty, and stopped.
+      torrentFileSystem.delete(output / "f1")
+      assertEquals(SeedingOutcome.CHANGED_ON_DISK,
+        source.startSeeding(v1SeedingTask(torrent, output, ids)))
+      assertEquals(0L, torrentFileSystem.metadata(output / "f1").size)
+      // The next check holds as it reads f2, having checked f0's pieces, when the owner drops f1.
+      val hold = payload.hold("f2")
+      val seeding = async { source.startSeeding(v1SeedingTask(torrent, output, ids)) }
+      hold.reached.await()
+      val session = assertNotNull(source.sessionOf("seeder"))
+      assertEquals(TorrentSessionState.CHECKING_FILES, session.state.value)
+      // The drop stops the check where it is and checks again with the smaller selection.
+      val drop = async { source.changeSeedingSelection("seeder", ids - "1") }
+      delay(200)
+      hold.released.complete(Unit)
+      assertTrue(drop.await())
+
+      assertEquals(SeedingOutcome.SEEDING, seeding.await())
+      assertEquals(TorrentSessionState.SEEDING, session.state.value)
+      val shared = setOf(torrent.piecesOf(1).first, torrent.piecesOf(1).last)
+      val kept = (torrent.piecesOf(0) + torrent.piecesOf(2)).toSet() - shared
+      val pieces = BooleanArray(torrent.pieceCount) { it in kept }
+      assertContentEquals(pieceBitfield(pieces), advertised(torrent, engine()))
+      assertEquals(0L, torrentFileSystem.metadata(output / "f1").size)
+      source.stopSeeding("seeder")
+    }
+  }
+
+  @Test
+  fun startSeeding_v1OwnedFileDroppedWhileNotSeedingThenDeleted_seedsWithoutTheSharedPieces() {
+    val torrent = MultiFileTorrent()
+    v1Seeding(torrent) { source, engine, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      source.seedWithF1Owned(torrent, output, ids)
+      source.stopSeeding("seeder")
+      // Dropped while the task does not seed, so no store sees it, then deleted.
+      torrentFileSystem.delete(output / "f1")
+
+      val outcome = source.startSeeding(v1SeedingTask(torrent, output, ids - "1"))
+
+      assertEquals(SeedingOutcome.SEEDING, outcome)
+      val shared = setOf(torrent.piecesOf(1).first, torrent.piecesOf(1).last)
+      val kept = (torrent.piecesOf(0) + torrent.piecesOf(2)).toSet() - shared
+      val pieces = BooleanArray(torrent.pieceCount) { it in kept }
+      assertContentEquals(pieceBitfield(pieces), advertised(torrent, engine()))
+      assertFalse(torrentFileSystem.exists(output / "f1"))
+      source.stopSeeding("seeder")
+    }
+  }
+
+  @Test
+  fun seeder_v1DroppedFileDeletedWhileSeeding_keepsSeedingWithoutTheSharedPiece() {
+    val torrent = MultiFileTorrent()
+    v1Seeding(torrent) { source, engine, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      assertEquals(SeedingOutcome.SEEDING,
+        source.startSeeding(v1SeedingTask(torrent, output, ids)))
+      val session = assertIs<KotlinTorrentSession>(source.sessionOf("seeder"))
+      assertTrue(source.changeSeedingSelection("seeder", ids - "1"))
+      // The owner deletes the file it dropped; a peer asks for a piece f0 shares with it.
+      torrentFileSystem.delete(output / "f1")
+      val shared = torrent.piecesOf(1).first
+      requestPiece(torrent, engine(), shared) { !session.verifiedPieces()[shared] }
+
+      // It seeds on without the piece, which it never offers nor downloads again.
+      assertNull(withTimeoutOrNull(1_000) {
+        session.state.first { it != TorrentSessionState.SEEDING }
+      })
+      assertEquals(setOf("seeder"), source.seedingTaskIds.value)
+      val pieces = BooleanArray(torrent.pieceCount) { it != shared }
+      assertContentEquals(pieceBitfield(pieces), advertised(torrent, engine()))
+      source.stopSeeding("seeder")
+    }
+  }
+
+  @Test
+  fun seeder_v1DroppedFileEditedWhileSeeding_keepsSeedingWithoutTheSharedPiece() {
+    val torrent = MultiFileTorrent()
+    v1Seeding(torrent) { source, engine, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      assertEquals(SeedingOutcome.SEEDING,
+        source.startSeeding(v1SeedingTask(torrent, output, ids)))
+      val session = assertIs<KotlinTorrentSession>(source.sessionOf("seeder"))
+      assertTrue(source.changeSeedingSelection("seeder", ids - "1"))
+      // The owner edits the file it dropped where it shares a piece with f0.
+      val edited = editInPlace(output / "f1", 0)
+      val shared = torrent.piecesOf(1).first
+      requestPiece(torrent, engine(), shared) { !session.verifiedPieces()[shared] }
+
+      assertNull(withTimeoutOrNull(1_000) {
+        session.state.first { it != TorrentSessionState.SEEDING }
+      })
+      val pieces = BooleanArray(torrent.pieceCount) { it != shared }
+      assertContentEquals(pieceBitfield(pieces), advertised(torrent, engine()))
+      source.stopSeeding("seeder")
+      assertContentEquals(edited, torrentFileSystem.read(output / "f1") { readByteArray() })
+    }
+  }
+
+  @Test
+  fun seeder_v1ChosenFileEditedInASharedPiece_downloadsThePieceAgain() {
+    val torrent = MultiFileTorrent()
+    v1Seeding(torrent) { source, engine, output ->
+      val ids = TorrentFileTable.parse(torrent.metainfo, TorrentConfig()).ids
+      assertEquals(SeedingOutcome.SEEDING,
+        source.startSeeding(v1SeedingTask(torrent, output, ids)))
+      val session = assertIs<KotlinTorrentSession>(source.sessionOf("seeder"))
+      assertTrue(source.changeSeedingSelection("seeder", ids - "1"))
+      // The owner edits f0 where it shares a piece with f1, which is as the check found it.
+      editInPlace(output / "f0", torrent.sizes[0] - 1)
+      val shared = torrent.piecesOf(1).first
+      requestPiece(torrent, engine(), shared) { !session.verifiedPieces()[shared] }
+
+      // A chosen file changed: seeding cannot serve around it, and the piece is wanted again.
+      assertEquals(TorrentSessionState.DOWNLOADING, withTimeout(5_000) {
+        session.state.first { it != TorrentSessionState.SEEDING }
+      })
+      source.stopSeeding("seeder")
+    }
   }
 
   @Test

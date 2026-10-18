@@ -5,10 +5,17 @@ import com.linroid.ketch.torrent.metainfo.Bencode
 import com.linroid.ketch.torrent.metainfo.TorrentMetadata
 import com.linroid.ketch.torrent.peer.pieceBitfield
 import com.linroid.ketch.torrent.tracker.TrackerConfiguration
+import okio.Buffer
 import okio.Path
 import okio.Path.Companion.toPath
 
 internal data class TorrentOwnedPath(val path: String, val identity: String)
+
+/**
+ * A payload file as a store last knew it: its [size] and modification time. A file whose stamp
+ * differs now was resized or written since; a change that keeps both cannot be seen.
+ */
+internal data class TorrentFileStamp(val size: Long, val modifiedAtMillis: Long)
 
 /** Versioned Kotlin state. The bitmap is a hint; recovery always rehashes the actual output. */
 internal data class TorrentCheckpoint(
@@ -25,6 +32,8 @@ internal data class TorrentCheckpoint(
   val trackerRevision: Long = 0,
   /** Payload received from peers and web seeds that was thrown away rather than verified. */
   val discardedBytes: Long = 0,
+  /** The files in place as the store last knew them, by file index ([TorrentFileStamp]). */
+  val stamps: Map<Int, TorrentFileStamp> = emptyMap(),
 ) {
   init {
     require(trackerRevision >= 0)
@@ -44,13 +53,21 @@ internal data class TorrentCheckpoint(
     "output" to output, "selected" to selected.sorted().map { it.toLong() },
     "verified" to pieceBitfield(verified),
     "files" to files.map { mapOf("path" to it.path, "identity" to it.identity) },
-    "directories" to directories.map { mapOf("path" to it.path, "identity" to it.identity) }
+    "directories" to directories.map { mapOf("path" to it.path, "identity" to it.identity) },
+    // Older builds ignore it, and read a checkpoint without it as knowing no file.
+    "file-stamps" to encodeStamps(stamps),
   ) + (trackerConfiguration?.let { mapOf("tracker-tiers" to it.tiers) } ?: emptyMap()) +
     (if (trackerRevision > 0) mapOf("tracker-revision" to trackerRevision) else emptyMap()),
     maxBytes = MAX_BYTES - MAGIC.size).let { MAGIC + it }.also { require(it.size <= MAX_BYTES) }
 
   companion object {
     const val MAX_BYTES = 16 * 1024 * 1024
+
+    /**
+     * Each stamp's share of the checkpoint: the file index, its size and its modification time,
+     * packed, so a torrent of many files adds little to the state its session is admitted with.
+     */
+    const val STAMP_BYTES = 20
     private val MAGIC = "KETCH-TORRENT\n".encodeToByteArray()
     private const val KIND = "ketch-kotlin-torrent"
 
@@ -118,13 +135,41 @@ internal data class TorrentCheckpoint(
           TorrentOwnedPath(path, identity)
         }.also { paths -> require(paths.map { it.path }.distinct().size == paths.size) }
       }
+      val stamps = root["file-stamps"]?.let {
+        decodeStamps(requireNotNull(it.bytes), metadata.files.size)
+      }.orEmpty()
       val receivedBytes = root["received"]?.integer ?: 0L
       val uploadedBytes = root["uploaded"]?.integer ?: 0L
       val discardedBytes = root["discarded"]?.integer ?: 0L
       require(receivedBytes >= 0 && uploadedBytes >= 0 && discardedBytes >= 0)
       return TorrentCheckpoint(task, metadata, output, selected, verified,
         owned("files"), owned("directories"), receivedBytes, uploadedBytes,
-        trackerConfiguration, trackerRevision, discardedBytes)
+        trackerConfiguration, trackerRevision, discardedBytes, stamps)
+    }
+
+    private fun encodeStamps(stamps: Map<Int, TorrentFileStamp>): ByteArray {
+      val output = Buffer()
+      for ((file, stamp) in stamps.entries.sortedBy { it.key }) {
+        output.writeInt(file).writeLong(stamp.size).writeLong(stamp.modifiedAtMillis)
+      }
+      return output.readByteArray()
+    }
+
+    /** Stamps of files of a torrent of [files], in increasing file order. */
+    private fun decodeStamps(bytes: ByteArray, files: Int): Map<Int, TorrentFileStamp> {
+      require(bytes.size % STAMP_BYTES == 0 && bytes.size / STAMP_BYTES <= files)
+      val input = Buffer().write(bytes)
+      var last = -1
+      return buildMap {
+        while (!input.exhausted()) {
+          val file = input.readInt()
+          require(file in last + 1 until files)
+          last = file
+          val size = input.readLong()
+          require(size >= 0)
+          put(file, TorrentFileStamp(size, input.readLong()))
+        }
+      }
     }
   }
 }

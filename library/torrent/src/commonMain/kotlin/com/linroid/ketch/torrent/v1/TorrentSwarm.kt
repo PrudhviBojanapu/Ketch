@@ -9,10 +9,12 @@ import com.linroid.ketch.torrent.api.TorrentStall
 import com.linroid.ketch.torrent.describeWithoutUrls
 import com.linroid.ketch.torrent.engine.StallRecovery
 import com.linroid.ketch.torrent.engine.StallSignals
+import com.linroid.ketch.torrent.engine.ThrottleClock
 import com.linroid.ketch.torrent.engine.TorrentBufferBudget
 import com.linroid.ketch.torrent.engine.TorrentRateLimiter
 import com.linroid.ketch.torrent.engine.TorrentStallWatchdog
 import com.linroid.ketch.torrent.engine.describe
+import com.linroid.ketch.torrent.engine.waiting
 import com.linroid.ketch.torrent.logHash
 import com.linroid.ketch.torrent.magnet.TorrentMetadataExchange
 import com.linroid.ketch.torrent.metainfo.Bencode
@@ -217,10 +219,10 @@ internal class TorrentSwarm(
   private val unchoking = mutableSetOf<Int>()
   // The one connection kept to each peer, guarded like [connected].
   private val identities = mutableMapOf<PeerIdentity, PeerWorker>()
-  // Payload received from peers (web seeds count theirs in their stats), and time spent waiting
-  // on speed limits for peers' and web seeds'.
+  // Payload received from peers (web seeds count theirs in their stats), and the time peers' and
+  // web seeds' payload spent waiting on speed limits, counted as it passes.
   private val payloadReceived = AtomicLong(0)
-  private val throttledMs = AtomicLong(0)
+  private val throttle = ThrottleClock(nowMs)
   private val uploaded = AtomicLong(0)
 
   /** Hole punching (BEP 55) runs for public torrents while uTP is on. */
@@ -346,10 +348,12 @@ internal class TorrentSwarm(
     }
     // A connection to the peer that listens at [endpoint], dialed there or not, ended while we
     // download: it is dialed again after its delay, or given up on. One that brought payload, over
-    // it or a connection it replaced, or that [lasted], counts as its first dial.
+    // it or a connection it replaced, or that [lasted], counts as its first dial, and a source
+    // naming the peer again may bring its dial forward at once: it was back.
     fun redial(endpoint: PeerEndpoint, broughtPayload: Boolean, lasted: Boolean) {
       if (endpoint in faulty || endpoint !in attempts && attempts.size >= MAX_CANDIDATES) return
       if (broughtPayload) delivered += endpoint
+      if (broughtPayload || lasted) broughtForwardAt.remove(endpoint)
       val dials = if (broughtPayload || lasted) 1 else attempts[endpoint] ?: 1
       attempts[endpoint] = dials
       // Never dialed, it still starts over once given up long enough and named again.
@@ -404,9 +408,7 @@ internal class TorrentSwarm(
     }
     // Payload from web seeds is throttled as peers' is; stall checks count it in [webSeedStats].
     val webSeedPayload: suspend (Int) -> Unit = { size ->
-      val at = nowMs()
-      downloadPayload(size)
-      throttledMs.addAndFetch(nowMs() - at)
+      throttle.waiting { downloadPayload(size) }
     }
     // One worker per seed for the whole transfer: started again, a seed keeps what it learned.
     val webSeedWorkers = webSeedUrls.mapIndexed { number, url ->
@@ -522,7 +524,7 @@ internal class TorrentSwarm(
         missingPieces = health?.missingCount ?: 0, missingFileIds = files,
         lateBlocks = health?.lateBlocks ?: 0, webSeeds = running,
         droppedWebSeeds = webSeeds.size - active.size, peerPayloadBytes = payloadReceived.load(),
-        webSeedPayload = webSeedStats.checked(), throttledMs = throttledMs.load(),
+        webSeedPayload = webSeedStats.checked(), throttledMs = throttle.throttledMs(),
         pieceLength = store.metadata.pieceLength,
       ))
       val current = watchdog.stall
@@ -894,8 +896,19 @@ internal class TorrentSwarm(
     private var fast = false
     /** Pieces this peer may download while we choke it (BEP 6), offered only while we upload. */
     private var allowedFast: Set<Int> = emptySet()
-    /** Pieces the peer rejected though it has them; fetched elsewhere until it unchokes us anew. */
-    private val refused = mutableSetOf<Int>()
+    /**
+     * Pieces the peer rejected though it has them, and when, on [nowMs]: fetched elsewhere until
+     * it unchokes us anew, announces the piece again, as a seeder that verified it again does,
+     * sends a block of it, answering a request it still owed, or [REFUSAL_MS] pass and it is asked
+     * again ([probing]). The scheduler hears of each change ([reportRefusals]).
+     */
+    private val refused = mutableMapOf<Int, Long>()
+    /**
+     * Pieces whose refusal lapsed ([expireRefusals]), which the peer is asked for again: still
+     * refused to the scheduler until the peer sends a block of one, announces it or unchokes us
+     * anew, so a stall keeps naming them while the peer takes its time to reject them again.
+     */
+    private val probing = mutableSetOf<Int>()
     /** Rejects of each piece's blocks while unchoked; as many as the piece has refuse it. */
     private val rejects = mutableMapOf<Int, Int>()
     /** Requests to keep outstanding: about [QUEUE_TIME_MS] of the peer's rate ([measureRate]). */
@@ -1110,11 +1123,9 @@ internal class TorrentSwarm(
         traffic?.received(message.bytes.size)
         if (attempt.payload == 0L) broughtPayload.store(true)
         attempt.payload += message.bytes.size
-        downloadPayload(message.bytes.size)
+        throttle.waiting { downloadPayload(message.bytes.size) }
         lastBlock += throttling.elapsedNow()
-        val throttled = nowMs() - throttledAt
-        lastUsefulPayload += throttled
-        throttledMs.addAndFetch(throttled)
+        lastUsefulPayload += nowMs() - throttledAt
         payloadReceived.addAndFetch(message.bytes.size.toLong())
       }
       require(fast || !message.isFastExtension()) { "Fast extension message without BEP 6" }
@@ -1134,7 +1145,13 @@ internal class TorrentSwarm(
         // peer cannot force a full snapshot and rarity scan per announcement.
         is PeerMessage.Bitfield, PeerMessage.HaveAll, PeerMessage.HaveNone ->
           scheduler.availability(id, state.availabilitySnapshot())
-        is PeerMessage.Have -> scheduler.announce(id, message.index)
+        is PeerMessage.Have -> {
+          scheduler.announce(id, message.index)
+          // A piece announced again, as a seeder that verified it again does, is asked for again.
+          if (rejects.isNotEmpty()) rejects.remove(message.index)
+          val lifted = refused.isNotEmpty() && refused.remove(message.index) != null
+          if (probing.remove(message.index) || lifted) reportRefusals()
+        }
         is PeerMessage.Control -> when (message.signal) {
           PeerMessage.Signal.CHOKE -> if (fast) {
             // Our requests stand until the peer rejects them; the block deadline restarts. A
@@ -1148,7 +1165,11 @@ internal class TorrentSwarm(
             scheduler.releasePeer(id)
           }
           PeerMessage.Signal.UNCHOKE -> {
-            refused.clear()
+            if (refused.isNotEmpty() || probing.isNotEmpty()) {
+              refused.clear()
+              probing.clear()
+              reportRefusals()
+            }
             rejects.clear()
             // Its rate is measured from now on: the time it choked us says nothing of it.
             if (wasChoking) {
@@ -1222,8 +1243,29 @@ internal class TorrentSwarm(
       }
       log.v { "Peer $endpoint of $logLabel keeps rejecting piece ${message.index}" }
       rejects.remove(message.index)
-      refused += message.index
+      refused[message.index] = nowMs()
+      // One it was asked for again stays refused to the scheduler.
+      if (!probing.remove(message.index)) reportRefusals()
     }
+
+    /**
+     * Asks the peer again for pieces it refused [REFUSAL_MS] ago: one that keeps us unchoked may
+     * never say it would send them now. The scheduler keeps them refused meanwhile ([probing]).
+     */
+    private fun expireRefusals() {
+      if (refused.isEmpty()) return
+      val now = nowMs()
+      val lapsed = refused.entries.iterator()
+      while (lapsed.hasNext()) {
+        val (index, at) = lapsed.next()
+        if (now - at < REFUSAL_MS) continue
+        lapsed.remove()
+        probing += index
+      }
+    }
+
+    /** Tells the scheduler which pieces the peer refuses: [refused] and [probing] ones. */
+    private suspend fun reportRefusals() = scheduler.refusing(id, refused.keys + probing)
 
     /** Cancels [requests] on the wire, handing their blocks back when [release]. */
     private suspend fun cancel(requests: List<PeerMessage.Request>, release: Boolean) {
@@ -1234,6 +1276,10 @@ internal class TorrentSwarm(
 
     private suspend fun receiveBlock(message: PeerMessage.Piece) {
       lastBlock = TimeSource.Monotonic.markNow()
+      // A piece it refused before that it sends now is one it serves.
+      val lifted = refused.isNotEmpty() && refused.remove(message.index) != null
+      val probed = probing.isNotEmpty() && probing.remove(message.index)
+      if (lifted || probed) reportRefusals()
       rateBytes += message.bytes.size
       when (val arrival = scheduler.received(id, message.index, message.begin, message.bytes)) {
         // Another copy came first, or the piece is done: the peer did nothing wrong.
@@ -1300,7 +1346,9 @@ internal class TorrentSwarm(
         } catch (revoked: PieceRevokedException) {
           // A piece outside the selection could not be read back: refuse it and keep the peer.
           log.d { "Swarm $logLabel: revoked piece ${revoked.index}" }
-          scheduler.revoke(revoked.index)
+          // One a seed-only store set aside is never fetched again.
+          if (revoked.setAside) scheduler.setAside(revoked.index)
+          else scheduler.revoke(revoked.index)
           rejectUploads()
           uploadCache.close()
           chokerMutex.withLock { choker.refused(id) }
@@ -1548,6 +1596,8 @@ internal class TorrentSwarm(
       }
       val poll = scheduler.poll(id, haveCursor)
       haveCursor = poll.haveCursor
+      // A piece the peer heard of that we lost is announced again once it verifies again.
+      poll.revoked?.forEach { advertised[it] = false }
       poll.haves?.let { verified ->
         val haves = verified.filter { !advertised[it] }
         for (index in haves) advertised[index] = true
@@ -1583,6 +1633,7 @@ internal class TorrentSwarm(
           if (wanted) PeerMessage.Signal.INTERESTED else PeerMessage.Signal.NOT_INTERESTED))
       }
       expireChokedRequests()
+      expireRefusals()
       if (state.pendingCount > 0 && lastBlock.elapsedNow().inWholeSeconds >= 20) {
         error("Peer block deadline exceeded")
       }
@@ -1615,6 +1666,9 @@ private const val REQUEST_QUEUE = 500
 
 /** How often a swarm checks whether it stalled. */
 private const val STALL_CHECK_MS = 1_000L
+
+/** How long a piece a peer refused is left to other peers before that peer is asked again. */
+private const val REFUSAL_MS = 60_000L
 
 /** The most missing pieces a stall check looks up the files of. */
 private const val MAX_REPORTED_MISSING_PIECES = 4_096

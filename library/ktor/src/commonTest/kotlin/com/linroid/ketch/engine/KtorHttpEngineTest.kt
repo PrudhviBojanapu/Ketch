@@ -4,7 +4,9 @@ import com.linroid.ketch.api.KetchApi
 import com.linroid.ketch.api.KetchError
 import com.linroid.ketch.api.Proxy
 import com.linroid.ketch.api.log.KetchLogger
+import com.linroid.ketch.api.log.LogLevel
 import com.linroid.ketch.api.log.Logger
+import com.linroid.ketch.api.log.describeCauses
 import com.linroid.ketch.core.engine.HttpBody
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
@@ -21,7 +23,9 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class KtorHttpEngineTest {
@@ -259,7 +263,7 @@ class KtorHttpEngineTest {
       KetchLogger.setLogger(Logger.None)
     }
     for (secret in listOf("s3cr3t", "t0ken", "pr0xy", "k3y", "r3f")) {
-      assertTrue(logged.none { secret in it }, secret)
+      assertTrue(logged.none { (_, message) -> secret in message }, secret)
     }
   }
 
@@ -517,6 +521,127 @@ class KtorHttpEngineTest {
   }
 
   @Test
+  fun requests_failuresARetryMayFix_areLoggedAtDebugLevel() = runTest {
+    // Callers retry them, warning as they do: an error each attempt said the same thing again.
+    val records = recordLogs()
+    try {
+      for (status in listOf(HttpStatusCode.ServiceUnavailable, HttpStatusCode.TooManyRequests)) {
+        withServer({ respond("", status) }) { engine, _ ->
+          assertFailsWith<KetchError.Http> { engine.download(URL, 0L..7L) {} }
+          assertFailsWith<KetchError.Http> { engine.probe(URL, emptyMap()) }
+        }
+      }
+      withServer({ throw IllegalStateException("Connection reset") }) { engine, _ ->
+        assertFailsWith<KetchError.Network> { engine.head(URL, emptyMap()) }
+        assertFailsWith<KetchError.Network> { engine.download(URL, null) {} }
+      }
+    } finally {
+      KetchLogger.setLogger(Logger.None)
+    }
+
+    assertEquals(emptyList(), records.filter { (level, _) -> level > LogLevel.DEBUG })
+    val logged = records.map { (_, message) -> message }
+    val failures = listOf(
+      "HTTP error 503: Service Unavailable for GET $URL",
+      "HTTP error 429: Too Many Requests for GET $URL",
+      "IllegalStateException: Connection reset",
+    )
+    for (failure in failures) {
+      assertEquals(2, logged.count { failure in it }, logged.joinToString("\n"))
+    }
+  }
+
+  @Test
+  fun download_clientError_isLoggedAsErrorWithItsUrl() = runTest {
+    // No retry helps.
+    val records = recordLogs()
+    try {
+      withServer({ respond("", HttpStatusCode.NotFound) }) { engine, _ ->
+        assertFailsWith<KetchError.Http> { engine.download(URL, null) {} }
+      }
+    } finally {
+      KetchLogger.setLogger(Logger.None)
+    }
+
+    assertEquals(
+      listOf(LogLevel.ERROR to "[KtorHttpEngine] HTTP error 404: Not Found for GET $URL"),
+      records.filter { (level, _) -> level > LogLevel.DEBUG },
+    )
+  }
+
+  @Test
+  fun download_failsAtRedirectTarget_errorNamesTheTarget() = runTest {
+    // The engine logs these at debug level only: what the caller reports when it gives up, such
+    // as the Coordinator's "Download failed", says where through the error.
+    var reset = false
+    withServer({ request ->
+      when {
+        request.url.host == "origin.example" ->
+          respond("", HttpStatusCode.Found, headersOf(HttpHeaders.Location, CDN_URL))
+        reset -> throw IllegalStateException("TLS handshake failed")
+        else -> respond("", HttpStatusCode.ServiceUnavailable)
+      }
+    }) { engine, _ ->
+      val refused = assertFailsWith<KetchError.Http> { engine.download(URL, null) {} }
+      reset = true
+      val failed = assertFailsWith<KetchError.Network> { engine.download(URL, null) {} }
+
+      assertEquals(
+        "Http: HTTP error 503: Service Unavailable <- FailedRequest: GET https://cdn.example/file",
+        refused.describeCauses(),
+      )
+      // Coroutines may add a copy of the exception they recover below it.
+      val causes = failed.describeCauses()
+      val expected = "Network: Network error occurred <- " +
+        "FailedRequest: GET https://cdn.example/file <- " +
+        "IllegalStateException: TLS handshake failed"
+      assertTrue(causes.startsWith(expected), causes)
+    }
+  }
+
+  @Test
+  fun failedRequest_urlWithCredentials_namesOnlyItsOriginAndPath() {
+    // Signed links carry tokens redactUrl does not know, such as a JWT, and the message may be
+    // shown to users, as an update's failure is.
+    val signed = Url("https://user:pass@cdn.example:8443/a/b%20c?sig=abc&jwt=eyJ.e30.c2ln#part")
+    assertEquals("GET https://cdn.example:8443/a/b%20c", FailedRequest("GET", signed).message)
+    val local = Url("http://[::1]:8080/file?token=abc")
+    assertEquals("HEAD http://[::1]:8080/file", FailedRequest("HEAD", local).message)
+    val origin = Url("https://cdn.example")
+    assertEquals("GET https://cdn.example", FailedRequest("GET", origin).message)
+  }
+
+  @Test
+  fun download_callbackFails_isTheCauseOfItsError() = runTest {
+    // Callers look for what their callback threw, such as GitHubReleases for its UpdateException.
+    val thrown = IllegalStateException("No space left on device")
+    withServer({ respond("abcdefgh", HttpStatusCode.OK) }) { engine, _ ->
+      val error = assertFailsWith<KetchError.Network> {
+        engine.download(URL, null) { throw thrown }
+      }
+
+      assertSame(thrown, error.cause)
+    }
+  }
+
+  @Test
+  fun requests_withoutRequestLogging_leaveTheUrlOutOfTheirErrors() = runTest {
+    // As a torrent's trackers are asked: their URLs may hold a passkey.
+    withServer({ respond("", HttpStatusCode.ServiceUnavailable) }, logRequests = false) {
+      engine, _ ->
+      val refused = assertFailsWith<KetchError.Http> { engine.download(URL, null) {} }
+
+      assertNull(refused.cause)
+    }
+    withServer({ throw IllegalStateException("Connection reset") }, logRequests = false) {
+      engine, _ ->
+      val failed = assertFailsWith<KetchError.Network> { engine.download(URL, null) {} }
+
+      assertIs<IllegalStateException>(failed.cause)
+    }
+  }
+
+  @Test
   fun probe_refused_throwsHttpError() = runTest {
     withServer({ respond("", HttpStatusCode.Forbidden) }) { engine, _ ->
       val error = assertFailsWith<KetchError.Http> { engine.probe(URL, emptyMap()) }
@@ -525,24 +650,24 @@ class KtorHttpEngineTest {
     }
   }
 
-  /** Sends every log record to the returned list until the logger is reset. */
-  private fun recordLogs(): List<String> {
-    val records = mutableListOf<String>()
+  /** Sends every log record, with its level, to the returned list until the logger is reset. */
+  private fun recordLogs(): List<Pair<LogLevel, String>> {
+    val records = mutableListOf<Pair<LogLevel, String>>()
     KetchLogger.setLogger(object : Logger {
       override fun v(message: String) {
-        records += message
+        records += LogLevel.VERBOSE to message
       }
       override fun d(message: String) {
-        records += message
+        records += LogLevel.DEBUG to message
       }
       override fun i(message: String) {
-        records += message
+        records += LogLevel.INFO to message
       }
       override fun w(message: String, throwable: Throwable?) {
-        records += message
+        records += LogLevel.WARN to message
       }
       override fun e(message: String, throwable: Throwable?) {
-        records += message
+        records += LogLevel.ERROR to message
       }
     })
     return records
@@ -641,6 +766,7 @@ class KtorHttpEngineTest {
   private suspend fun withServer(
     handler: MockRequestHandler,
     userAgent: String? = KtorHttpEngine.DEFAULT_USER_AGENT,
+    logRequests: Boolean = true,
     block: suspend (KtorHttpEngine, List<HttpRequestData>) -> Unit,
   ) {
     val requests = mutableListOf<HttpRequestData>()
@@ -648,7 +774,7 @@ class KtorHttpEngineTest {
       requests += request
       handler(request)
     })
-    val engine = KtorHttpEngine(client, userAgent = userAgent)
+    val engine = KtorHttpEngine(client, logRequests, userAgent)
     try {
       block(engine, requests)
     } finally {

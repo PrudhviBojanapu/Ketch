@@ -44,12 +44,15 @@ import com.linroid.ketch.core.task.TaskRecord
 import com.linroid.ketch.core.task.TaskState
 import com.linroid.ketch.core.task.isKeptWithTask
 import kotlin.concurrent.Volatile
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.time.Clock
 import kotlin.time.Instant
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -79,6 +82,7 @@ import okio.Path.Companion.toPath
  * @param clock stamps [TaskRecord.completedAt] when the download completes
  * @param openFile opens the output file of a source that does not write its own files
  */
+@OptIn(ExperimentalAtomicApi::class)
 internal class DownloadExecution(
   private val handle: TaskHandle,
   private val sourceResolver: SourceResolver,
@@ -144,13 +148,24 @@ internal class DownloadExecution(
    */
   fun discardPartialFile() { discardsPartialFile = true }
 
+  @Volatile
+  private var flushesKeptFile = false
+
+  /**
+   * Flushes the file this execution keeps before closing it, once it stops before its last
+   * flush, as the saved segments count those bytes. Set before a pause, reschedule or preemption
+   * cancels it. A failure, `Ketch.close()` or `remove(deleteFiles = false)`, which drops the record
+   * that would resume from the file, leaves it to the system, so neither the failure, the sources'
+   * stop nor the removal waits for the disk.
+   */
+  fun flushKeptFile() { flushesKeptFile = true }
+
   /**
    * Per-task limiter, created from the persisted request so a limit set
    * while the task was not running applies from the first byte.
    */
   val taskLimiter = DelegatingSpeedLimiter(createLimiter(handle.request.speedLimit))
   var context: DownloadContext? = null
-  var fileAccessor: FileAccessor? = null
 
   /** The size of the download; a selection delivered while it runs changes it. */
   @Volatile
@@ -164,6 +179,28 @@ internal class DownloadExecution(
 
   /** Whether the source returned and this execution is completing; it takes no selections. */
   val isFinishing: Boolean get() = finishing
+
+  // What ends this run first: a pause ([claimStop]) or, once its file is verified, its
+  // completion ([claimCompletion]).
+  private val ending = AtomicInt(RUNNING)
+
+  /**
+   * Claims the end of this run for a pause, reschedule or preemption, which cancels it next.
+   * Returns `false` once the run is completing: its file is verified and it completes whatever
+   * stops it, so the task must not be shown paused on its way there.
+   */
+  fun claimStop(): Boolean {
+    ending.compareAndSet(RUNNING, STOPPING)
+    return ending.load() == STOPPING
+  }
+
+  /**
+   * Claims this run's completion before it runs to the end whatever stops it. A run a pause
+   * claimed first stops instead, as the pause cancels it next, keeping its verified file.
+   */
+  private suspend fun claimCompletion() {
+    if (!ending.compareAndSet(RUNNING, COMPLETING)) awaitCancellation()
+  }
 
   /**
    * Hands a saved selection of [fileIds], [total] bytes in size, to the running download, which
@@ -375,7 +412,8 @@ internal class DownloadExecution(
    * from the source's own metadata ([DownloadSource.planSelection]) rather than the client's, or
    * the whole content.
    *
-   * @throws IllegalArgumentException when a source offering a single choice is given several
+   * @throws KetchError.SourceError when the source refuses the selection, such as several
+   *   variants of a source offering a single choice, or files it does not list, which it names
    */
   private suspend fun freshTotal(
     source: DownloadSource<*>,
@@ -383,8 +421,14 @@ internal class DownloadExecution(
     selected: Set<String>,
   ): Long {
     if (selected.isEmpty()) return resolved.totalBytes
-    require(resolved.selectionMode != FileSelectionMode.SINGLE || selected.size == 1) {
-      SINGLE_CHOICE_MESSAGE
+    if (resolved.selectionMode == FileSelectionMode.SINGLE && selected.size > 1) {
+      throw refusedSelection(source, SINGLE_CHOICE_MESSAGE)
+    }
+    // A source lists every file it takes, never padding: what it lacks is named here.
+    val listed = resolved.files.mapTo(HashSet()) { it.id }
+    val unknown = selected.filter { it !in listed }
+    if (listed.isNotEmpty() && unknown.isNotEmpty()) {
+      throw refusedSelection(source, unknownFilesMessage(unknown))
     }
     return try {
       source.planSelection(
@@ -400,15 +444,30 @@ internal class DownloadExecution(
         )
       ).totalBytes
     } catch (_: UnsupportedOperationException) {
-      require(selected.all { id -> resolved.files.any { it.id == id } }) {
-        "Unknown selected file"
-      }
+      if (unknown.isNotEmpty()) throw refusedSelection(source, unknownFilesMessage(unknown))
       resolved.files.filter { it.id in selected }.fold(0L) { sum, file ->
         require(file.size >= 0 && sum <= Long.MAX_VALUE - file.size)
         sum + file.size
       }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: IllegalArgumentException) {
+      throw refusedSelection(source, e.message, e)
+    } catch (e: IllegalStateException) {
+      throw refusedSelection(source, e.message, e)
     }
   }
+
+  /** The task fails saying why [source] refused its selection, rather than as an unknown error. */
+  private fun refusedSelection(
+    source: DownloadSource<*>,
+    reason: String?,
+    cause: Throwable? = null,
+  ): KetchError.SourceError = KetchError.SourceError(
+    sourceType = source.type,
+    cause = cause ?: IllegalArgumentException(reason),
+    detail = reason ?: "The selected files cannot be downloaded",
+  )
 
   /**
    * Stops the task, which asked to wait for a file selection, once its files are known. The
@@ -528,6 +587,8 @@ internal class DownloadExecution(
     val selfManagedIo = source.managesOwnFileIo
     var opened: FileAccessor? = null
     var completed = false
+    // Whether the run stopped before its last flush, so the file it keeps still needs one.
+    var unflushed = true
     try {
       currentCoroutineContext().ensureActive()
       val (prepared, ctx) = handle.controlLock.withLock {
@@ -544,7 +605,6 @@ internal class DownloadExecution(
           openFile(prepared.target.writePath, dispatchers.disk)
         }
         opened = accessor
-        fileAccessor = accessor
         val built = buildContext(
           fileAccessor = accessor,
           totalBytes = prepared.total,
@@ -653,10 +713,15 @@ internal class DownloadExecution(
       if (!selfManagedIo) {
         try {
           fa.flush()
+          unflushed = false
           // Content of unknown size was streamed to its end, so the file holds all of it.
           if (total < 0) finalTotal = fa.size()
         } catch (e: Exception) {
+          // A flush a pause cancels may never have run, as one queued for a busy disk, so the run
+          // flushes the file it keeps as it closes it.
           if (e is CancellationException) throw e
+          // Tried once: a file whose flush failed keeps no progress to flush for.
+          unflushed = false
           // The written bytes may not have reached the disk, so none of them count as progress.
           withContext(NonCancellable) { discardProgress() }
           if (e is KetchError) throw e
@@ -668,40 +733,46 @@ internal class DownloadExecution(
       // Hashed after the last flush, so the digest covers the bytes on disk, and before the
       // move, so a file that does not match never takes the final name.
       val verified = if (selfManagedIo) null else verify(fa, ctx.publishedChecksum, finalTotal)
-      if (!selfManagedIo) {
-        // Closed before the move: some systems, such as Windows, cannot move an open file.
-        fa.close()
-        outputPath = moveToFinal(target)
-      }
+      // Verified, the download is done. A pause, reschedule or preemption that cancels this job
+      // from here on finds it completed: stopped once the move landed, it would resume without
+      // its partial file and download the file again beside it.
+      claimCompletion()
+      withContext(NonCancellable) {
+        if (!selfManagedIo) {
+          // Closed before the move: some systems, such as Windows, cannot move an open file.
+          fa.close()
+          outputPath = moveToFinal(target)
+        }
 
-      val finalTime = downloadTime()
-      val finishedAt = finishTime()
-      handle.record.update {
-        it.copy(
-          state = TaskState.COMPLETED,
+        val finalTime = downloadTime()
+        val finishedAt = finishTime()
+        handle.record.update {
+          it.copy(
+            state = TaskState.COMPLETED,
+            outputPath = outputPath,
+            partialPath = null,
+            totalBytes = finalTotal,
+            segments = null,
+            downloadTime = finalTime,
+            completedAt = finishedAt,
+            updatedAt = finishedAt,
+          )
+        }
+
+        completed = true
+        log.i { "Download completed for taskId=$taskId" }
+        handle.mutableState.value = DownloadState.Completed(
           outputPath = outputPath,
-          partialPath = null,
-          totalBytes = finalTotal,
-          segments = null,
+          totalBytes = finalTotal.takeIf { it >= 0 },
           downloadTime = finalTime,
           completedAt = finishedAt,
-          updatedAt = finishedAt,
+          checksum = verified,
         )
       }
-
-      completed = true
-      log.i { "Download completed for taskId=$taskId" }
-      handle.mutableState.value = DownloadState.Completed(
-        outputPath = outputPath,
-        totalBytes = finalTotal.takeIf { it >= 0 },
-        downloadTime = finalTime,
-        completedAt = finishedAt,
-        checksum = verified,
-      )
     } finally {
       val accessor = opened
       if (!selfManagedIo && accessor != null) {
-        cleanupAfterExecution(accessor, completed)
+        cleanupAfterExecution(accessor, completed, unflushed)
       }
     }
   }
@@ -781,42 +852,47 @@ internal class DownloadExecution(
       log.w { "Checksum mismatch for empty taskId=$taskId: ${wanted.algorithm.label}" }
       throw mismatch(wanted, empty, published = expected == null)
     }
-    val fa = openFile(target.writePath, dispatchers.disk)
-    try {
-      // Create or truncate the destination; flushing a lazy accessor alone is insufficient.
-      fa.preallocate(0)
-      fa.flush()
-    } catch (e: Exception) {
-      if (e is CancellationException) throw e
-      throw KetchError.Disk(e)
-    } finally {
+    // Created and completed even when a stop lands meanwhile, as a larger download is once
+    // verified: a partial file left behind would take the final name from the next run.
+    claimCompletion()
+    withContext(NonCancellable) {
+      val fa = openFile(target.writePath, dispatchers.disk)
       try {
-        fa.close()
+        // Create or truncate the destination; flushing a lazy accessor alone is insufficient.
+        fa.preallocate(0)
+        fa.flush()
       } catch (e: Exception) {
-        log.w(e) { "Failed to close file for taskId=$taskId" }
+        if (e is CancellationException) throw e
+        throw KetchError.Disk(e)
+      } finally {
+        try {
+          fa.close()
+        } catch (e: Exception) {
+          log.w(e) { "Failed to close file for taskId=$taskId" }
+        }
       }
-    }
-    val outputPath = moveToFinal(target)
-    val finishedAt = finishTime()
-    handle.record.update {
-      it.copy(
+      val outputPath = moveToFinal(target)
+      val finishedAt = finishTime()
+      handle.record.update {
+        it.copy(
+          outputPath = outputPath,
+          partialPath = null,
+          state = TaskState.COMPLETED,
+          totalBytes = 0,
+          segments = null,
+          sourceType = sourceType,
+          completedAt = finishedAt,
+          updatedAt = finishedAt,
+        )
+      }
+      handle.mutableState.value = DownloadState.Completed(
         outputPath = outputPath,
-        partialPath = null,
-        state = TaskState.COMPLETED,
         totalBytes = 0,
-        segments = null,
-        sourceType = sourceType,
+        downloadTime = handle.record.value.downloadTime,
         completedAt = finishedAt,
-        updatedAt = finishedAt,
+        checksum = wanted,
       )
     }
-    handle.mutableState.value = DownloadState.Completed(
-      outputPath = outputPath,
-      totalBytes = 0,
-      downloadTime = handle.record.value.downloadTime,
-      completedAt = finishedAt,
-      checksum = wanted,
-    )
   }
 
   /**
@@ -826,10 +902,24 @@ internal class DownloadExecution(
   private fun finishTime(): Instant =
     Instant.fromEpochMilliseconds(clock.now().toEpochMilliseconds())
 
+  /**
+   * Closes the file of a run that ended, flushing it first when the run stopped before its last
+   * flush ([unflushed]) and a pause keeps it ([flushKeptFile]), and deletes it when the run was
+   * discarded. Only this run touches its file, so nothing flushes it while it closes.
+   */
   private suspend fun cleanupAfterExecution(
     fa: FileAccessor,
     completed: Boolean,
+    unflushed: Boolean,
   ) {
+    if (unflushed && flushesKeptFile && !discardsPartialFile) {
+      // The saved segments count these bytes, so a resume trusts them to be on disk.
+      try {
+        withContext(NonCancellable) { fa.flush() }
+      } catch (e: Exception) {
+        log.w(e) { "Failed to flush the kept file of taskId=$taskId" }
+      }
+    }
     try {
       fa.close()
     } catch (e: Exception) {
@@ -886,7 +976,7 @@ internal class DownloadExecution(
           retryCount = 0
         }
         if (!error.isRetryable || !policy.allows(retryCount)) {
-          // DownloadCoordinator logs the failure itself, with its stack trace.
+          // DownloadCoordinator logs the failure itself, an unknown one with its stack trace.
           log.i {
             if (error.isRetryable) "Giving up on taskId=$taskId after $retryCount retries"
             else "Not retrying taskId=$taskId: ${error::class.simpleName} is not retryable"
@@ -972,9 +1062,14 @@ internal class DownloadExecution(
         }
         val report = DownloadProgress(downloaded, total, reportedSpeed.value ?: speed)
         lastReport = report
-        // The hold is read on every attempt, so no report replaces a state shown once it began.
+        // The hold is read on every attempt, so no report replaces a state shown once it began,
+        // and none undoes a cancel.
         handle.mutableState.update { current ->
-          if (reportsProgress.value && !progressHeld) DownloadState.Downloading(report) else current
+          if (reportsProgress.value && !progressHeld && current !is DownloadState.Canceled) {
+            DownloadState.Downloading(report)
+          } else {
+            current
+          }
         }
       },
       throttle = { bytes ->
@@ -1141,4 +1236,10 @@ internal class DownloadExecution(
     val segments: List<Segment>,
   )
 
+  private companion object {
+    // The values of [ending].
+    const val RUNNING = 0
+    const val STOPPING = 1
+    const val COMPLETING = 2
+  }
 }

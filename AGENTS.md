@@ -80,7 +80,8 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   which the instance fetches, or `Content(bytes, fileName)` the caller holds; the `resolve(url)`
   and `resolve(bytes, fileName)` extensions build them; a `KetchError.Unsupported` it throws is
   caused by a `NoDownloadSourceException` when no source takes the input, else by what the
-  source that does lacks, such as a usable proxy),
+  source that does lacks, such as a usable proxy; its `reason()` (`@InternalKetchApi`) says
+  which, as the server, MCP and `ketch --list-files` word it),
   `ActiveConnections`, `ActiveConnection`, `ConnectionDirection`, `ConnectionRoute`, `PeerDetails`,
   `CountryDatabase` (its `Key` is a `ControlKey`) and `CountryDatabaseStatus`,
   `ControlKey` (`KetchApi.controller(key)` looks up optional typed controllers that other modules
@@ -241,7 +242,10 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   `TorrentPieceScheduler`, `TorrentPeerDownloader`, `TorrentUploadCache`
 - `com.linroid.ketch.torrent.v2` -- v2 and hybrid sessions: `TorrentV2DownloadSession`,
   `TorrentV2SessionLoop` (`TorrentV2Swarm`), `TorrentV2PieceScheduler`, `TorrentV2Candidates`,
-  `TorrentV2Uploader`, `TorrentV2Extensions`, `TorrentV2ServeWorker` and their peers' views
+  `TorrentV2Uploader`, `TorrentV2Extensions`, `TorrentV2ServeWorker` and their peers' views,
+  and `TorrentV2Speed`, a task's speed measured between block arrivals over at least a second
+  and four blocks (up to 20 s back), so a low limit reads near the limit rather than a block or
+  none each second
 - `com.linroid.ketch.torrent.v2.peer` -- v2 peer connections: `PeerV2Connector`,
   `PeerV2Dialer`, `PeerV2Pool`, `PeerV2DownloadActor`, `PeerBlockExchange` and the BEP 52 hash
   exchange (`PeerHashWire`, `PeerHashTransport`, `PeerHashExchange`, `TorrentV2HashServer`)
@@ -344,7 +348,9 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   expected to finish last (`SegmentLedger.steal`) instead of closing, with a request of its own.
   The split is where both finish together, from rates measured once a lane ran 1 s (with 0.5 s
   for a new request's setup), else in half; a lane that received nothing in that time hands over
-  everything it has not admitted, and its idle transfer is cancelled. Only ranges of at least
+  everything it has not admitted, and its idle transfer is cancelled (one left with no byte at all
+  is replaced by the new lane, never saved as an empty range), while a connection that received
+  nothing in its last measured lane takes over nothing and closes. Only ranges of at least
   `DEFAULT_MIN_SPLIT_BYTES` (1 MiB) are handed over, so small files stay on their connections,
   and never without range support or when an HTTP server counts the requests left
   (`RateLimit-Remaining`), as each takeover is a request. Sources write what
@@ -372,7 +378,16 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   only `User-Agent`, `Accept`, `Accept-Encoding`, `Accept-Language` and `Referer` cut to its
   origin, and drops URL user info. `RedirectCache` remembers each request's final target and
   that hop's headers (per URL and headers, 30 minutes, 64 entries); HEAD and probes always follow
-  the redirects and refresh it, GETs reuse it and forget it when the target fails
+  the redirects and refresh it, GETs reuse it and forget it when the target fails. It logs
+  transport failures, 5xx and 429 at debug, as callers retry them (`DownloadExecution` warns at
+  each retry, `DownloadCoordinator` reports the failure), and only other refusals of a GET or
+  probe as errors, naming the URL. Its errors for HTTP error statuses and transport failures
+  name the request in a cause (`FailedRequest`: the method and the URL after redirects, without
+  user info or query, whose tokens `redactUrl` may miss and which update failures show users), so
+  those warnings say where; not the errors it raises itself on a response it refuses (another
+  range, a body of the wrong length or too long, a redirect it will not follow) or after 20
+  redirects, nor with `logRequests = false`, nor for what an `onData` callback throws, which
+  stays the `KetchError.Network`'s cause
 - Names from a server (`Content-Disposition`), a URL or an FTP path pass through
   `sanitizeFileName()` (last `/` or `\` segment, no control, bidi or Windows-reserved characters
   or device names, at most 255 UTF-8 bytes, `null` when nothing is left), in the sources and again
@@ -390,7 +405,15 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   After the last flush the file is closed and moved with okio `atomicMove`; a file that appeared
   at the final name meanwhile is kept, and the download takes the next free `name (n).ext` and
   records it as its output path (a file created in the instant between the check and the move
-  would still be replaced). A file `Destination` is replaced, as it was written in place before.
+  would still be replaced). Once the file is verified (an empty file once its checksum is), its
+  creation when empty, the move, the `COMPLETED` record and the `Completed` state run under
+  `NonCancellable`, so a pause, reschedule, preemption or `close()` landing meanwhile finds the
+  task completed rather than downloading the file again beside it, and a cancel landing then
+  came too late: the task stays completed, with its file. The run claims that step
+  (`DownloadExecution.claimCompletion`) against a pause's `claimStop`: a pause, reschedule or
+  preemption that finds the run completing only waits for it, never showing `Paused` first, and
+  one that claimed first stops the run, which keeps its verified file for the resume.
+  A file `Destination` is replaced, as it was written in place before.
   Pause, failure, `close()` and `remove(deleteFiles = false)` keep the partial file; cancel and
   `remove(deleteFiles = true)` delete it, never a file at the final name the task did not write.
   A name too long for the suffix (over 249 bytes), a resume given a new destination and tasks
@@ -430,9 +453,15 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   uses too; `updater` verifies
   release assets through `DownloadRequest.checksum`
 - Only `cancel()` and `remove(deleteFiles = true)` delete a partial file (the coordinator tells the
-  execution); a failure, `close()` or `remove(deleteFiles = false)` keeps it and its segments, but
-  a failed final flush resets their progress. For files the engine writes (not torrents), an empty
-  segment list is no progress: it is never saved, and resuming one starts from zero
+  execution; a canceled torrent keeps its files and sidecar until the task is removed, which deletes
+  the files only with `deleteFiles`); a pause, a failure, `close()` or `remove(deleteFiles = false)`
+  keeps it and its segments, but a failed final flush resets their progress. A run that a pause
+  stops before its last flush flushes the file itself before closing it
+  (`DownloadExecution.flushKeptFile`; never the pause, which would race the close); a failure,
+  `close()` or `remove(deleteFiles = false)`, whose record goes, closes it unflushed, so none waits
+  for the disk. For files the engine writes (not
+  torrents), an empty segment list is no progress: it is never saved, and resuming one starts from
+  zero
 - `DownloadState.Completed` reports the size and the download time, summed over every run and
   excluding time scheduled, queued or paused (`TaskRecord.downloadTime`, unknown for older records),
   and `completedAt`, stamped in whole milliseconds each time the task completes (a selection
@@ -455,7 +484,14 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   2 s at most) and stops its seeders side by side, each saving its state while it announces and
   again once paused, while the downloads pause, so all of them announce, and the router forgets
   the port, within that window; its `stop()` waits for them, stops seeders that started since,
-  then stops the engine, whose remaining sessions get what is left of the window. Ketch
+  then stops the engine, whose remaining sessions get what is left of the window. A session's
+  `stopped` announces, and a tracker-only magnet lookup's, run detached in the engine
+  (`KotlinTorrentEngine.sayGoodbye`, within 2 s, from a snapshot of its pieces and counters), so
+  canceling, pausing or removing a task, or a lookup that ends, never waits on its trackers,
+  while the next announces that start the same topic, a lookup's included, wait for them
+  (`awaitGoodbyes`), so a task resumed or retried at once never reaches a tracker before its
+  `stopped`; the engine's stop ends its magnet lookups beside its sessions, those in their grace
+  too, and waits for them within the window. Ketch
   closes dispatchers it was given only once every cancelled coroutine has finished, never under
   them, and never `KetchDispatchers.Default`, whose `close()` does nothing.
   `KetchApi.shutdown(timeout)` (5 s by default; `close()` for other implementations) does the
@@ -493,7 +529,17 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   database SQLite reports corrupt or not a database aside to `<name>.broken-<UTC time>`, with its
   journal, and starts an empty one (on Android also when corruption shows up later, instead of
   Android deleting it), telling its `onUnreadable` callback
-- Duplicate download guards in `DownloadCoordinator.start()` and `resume()`
+- Duplicate download guards in `DownloadCoordinator.start()` and `resume()`, which decide, save
+  and launch under the coordinator's lock and refuse a canceled task: `cancel` marks it there
+  (`canceling`) until it shows `Canceled`, so a cancel or remove landing while the queue starts a
+  task either finds the execution and stops it or keeps it from starting, and its slot is freed.
+  The queue's and a pause's writes keep a `CANCELED` record and a `Canceled` state, and a
+  reschedule's keep any ended one (a run that completes as it stops stays completed); a task that
+  ended never waits for a schedule, a canceled one takes no slot from another (an urgent one
+  canceled as it is queued), and no progress report replaces `Canceled`
+- `remove` deletes the record under its `AtomicSaver`'s lock and closes it (`close`): a write
+  after it, such as a late source save or a setting, saves nothing, so a removed task never comes
+  back after a restart; the task leaves `tasks` right after
 - A source that writes its own files (torrents) resumes into the output path its task chose even
   when no segments were saved yet, as when the process exits right after a start: starting over
   would pick a new `name (n)` beside the files it already owns
@@ -596,6 +642,10 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
 - URGENT preemption: pauses lowest-priority active download to make room; the victim stays
   in the queue as `Paused(Preempted)` with a `QUEUED` record and resumes when a slot frees.
   Tasks that already finished are never preempted
+- Queue changes finish even when their caller is cancelled (a REST client that leaves, a
+  scheduled task's wait its cancel stops): a pause or reschedule whose task is stopping, a
+  preemption whose victim is, and a start the queue makes, so no task keeps a slot with no
+  execution
 - `DownloadTask.queuePosition`: 1-based place of `Queued` and preempted tasks in the queue
   (priority, then age), published under the queue mutex after every change; `null` otherwise,
   and never persisted
@@ -630,7 +680,8 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
 - `DownloadSchedule.Immediate`, `AtTime(Instant)`, `AfterDelay(Duration)`
 - `DownloadCondition`: sealed; `DownloadCondition.Test(flow)` gates a task on a runtime
   `Flow<Boolean>` (e.g., WiFi-only)
-- Reschedule support via `DownloadTask.reschedule()`
+- Reschedule support via `DownloadTask.reschedule()`, which stops the task first, also one still
+  starting (shown `Queued` while it looks its content up, as a magnet does)
 
 ### Pluggable Download Sources (`DownloadSource`)
 - `SourceResolver` routes URLs to the appropriate source
@@ -751,18 +802,22 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   (`download.awaitFileSelection`) in `DownloadSource.features`; clients gate on those, never on
   the source type
 - `DownloadRequest.selectedFileIds` specifies which files to download; empty downloads the
-  source's default (every file, or the first variant)
+  source's default (every file, or the first variant). `download` refuses IDs a given
+  `resolvedSource` does not list (`IllegalArgumentException`); a start fails with a
+  `KetchError.SourceError` naming the IDs its resolution does not list (`unknownFilesMessage`:
+  a torrent's padding files too), or saying why its source refused the selection
 - `DownloadTask.selectFiles` changes the selection in every state but canceled (default throws
   `UnsupportedOperationException`; `RemoteDownloadTask` sends `PUT /api/tasks/{id}/files`). Ketch
   validates it with `DownloadSource.planSelection` against metadata the source holds, never
-  client sizes, fitting a running download's latest segments (else the saved ones), saves it
-  (selection, total, segments and `TaskControl.selectionGeneration` in one record write; the
-  task shows the plan first, so its new request never comes with the old selection's size: a
-  running task the plan's progress, dropping its transfer's reports until the selection is
-  delivered, a paused one (waiting for files too) the saved segments' progress and a completed
-  one the new size, also when it reopens, which the queue then shows `Queued`; a failed save
-  shows the state as it was again, never of another kind; a started task still `Queued` as its
-  first report was dropped then shows it as the plan),
+  client sizes (the torrent source names unknown IDs with core's `@InternalKetchApi`
+  `unknownFilesMessage`, as Ketch does), fitting a running download's latest segments (else the
+  saved ones), saves it (selection, total, segments and `TaskControl.selectionGeneration` in one
+  record write; the task shows the plan first, so its new request never comes with the old
+  selection's size: a running task the plan's progress, dropping its transfer's reports until the
+  selection is delivered, a paused one (waiting for files too) the saved segments' progress and a
+  completed one the new size, also when it reopens, which the queue then shows `Queued`; a failed
+  save shows the state as it was again, never of another kind; a started task still `Queued` as
+  its first report was dropped then shows it as the plan),
   then delivers it: a running task takes it live as a new `DownloadContext.selection` revision,
   whose files the source reports from then on and acknowledges (a run that ends with an
   unacknowledged selection runs again through `resume`, so completion covers the latest one);
@@ -899,8 +954,9 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   list, http/https only, at most 16) and magnet `ws` parameters (`MagnetUri.webSeeds`, carried
   into the rebuilt metainfo by `metainfoFromInfo`). The v1 swarm runs a `WebSeedWorker` per URL
   (`TorrentWebSeed.kt`) through the engine's `TorrentHttp` (`fetchRange`, which fails with
-  `HttpIdleException` after 30 s without data): to `TorrentPieceScheduler` it is a peer with every
-  piece that claims runs in order (`claimRun`), so peers and seeds never fetch the same piece
+  `HttpIdleException` 30 s after the last data, checked every second): to `TorrentPieceScheduler`
+  it is a peer with every piece that claims runs in order (`claimRun`), so peers and seeds never
+  fetch the same piece
   outside the endgame. A run is the first free wanted piece and the free wanted pieces after it,
   at most `WEB_SEED_RUN_PIECES` (16) and `WEB_SEED_RUN_BYTES` (4 MiB), no more than its share of
   the free pieces split between every peer and seed (the swarm joins every seed before any
@@ -940,7 +996,17 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
 - Magnet metadata is asked of sixteen peers at once (`METADATA_PARALLEL_PEERS`), failed peers
   again after 5, 15 and 30 s; tasks
   and previews keep looking (`DownloadSource.resolve`, in 2-minute lookups that ask given-up
-  peers again) until found or stopped. The apps show such a task as Starting, "Finding peers",
+  peers again) until found or stopped. A btih info lookup (`TorrentMetadataCache`) runs while a
+  task or preview waits for it, and `ABANDONED_LOOKUP_GRACE` (5 s) after the last left, then is
+  canceled: pausing, canceling or removing a task stops its discovery then, while a task resumed,
+  or a preview's link added, meanwhile carries on with it and its peers, unless that link names a
+  usable tracker or (outside tracker-only lookups) a peer the lookup does not ask
+  (`LookupSources`): the lookup is then canceled at once, and one of the link's starts once it
+  ended. Past
+  `MAX_PENDING_METADATA` (16), those in their grace included, new lookups wait for one to end.
+  V2 lookups (`fetchV2Metadata`), of a btmh magnet or of the piece layers a btih magnet of a
+  hybrid torrent then needs, have no grace and are not shared: they stop as their caller leaves.
+  The apps show such a task as Starting, "Finding peers",
   and a preview that takes 2 minutes offers Keep waiting and Add anyway. A peer has
   `METADATA_IDLE_MS` (30 s) for each part it sends (`MetadataProgress`: an info block or a piece
   layer response) and six times it in all, and a lookup goes on past its time while one arrives
@@ -952,9 +1018,14 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   discovery (v1, and v2 as `PeerOrigin.EXPLICIT` in the swarm they answered in)
 - Stalls: each swarm checks itself every second (`TorrentStallWatchdog`): no payload for 30 s, or no
   verified piece for four pieces' worth of time at its rate (1 to 10 minutes, again from payload
-  back after a gap once some of it is kept, once until the next piece; time waiting on speed
-  limits never counts), is a stall, whose reason (`TorrentStall`: missing pieces no connected
-  peer or running web seed has and every stopped one could not serve, a seed started again
+  back after a gap once some of it is kept, once until the next piece; time payload waits on
+  speed limits never counts, as it passes and overlapping waits once, also for payload later
+  thrown away: `ThrottleClock`, but for the requests of a v2 peer that rejected a piece's worth
+  since its last block, `rejectsSinceBlock`), is a stall, whose reason (`TorrentStall`: missing
+  pieces no
+  connected peer or running web seed has (in v1, or every connected peer that has them refuses,
+  `TorrentPieceScheduler.refusing`)
+  and every stopped one could not serve, a seed started again
   counting as stopped until it answers (`WebSeedWorker.unproven`) and one dropped again once
   started again without answering aside until a later relaunch finds it answering, and their
   files, kept 10 s after the last source leaves;
@@ -994,10 +1065,12 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   run's starting recheck drops a deselected file's bits, and other states show no progress)
 - Live file selection for v1, v2 and hybrid: a running swarm or v2 loop takes a new selection
   without reconnecting its peers. v1 keeps the files it created ("materialized" files) and their
-  verified pieces when they are deselected, copies verified spans of boundary pieces from the
-  task's sidecar into newly selected files and rehashes them, discards pieces no longer wanted
-  without blaming the peer, and revokes rather than fails on an unreadable piece outside the
-  selection; a recheck heals a piece from its sidecar. v2 and hybrid create or recheck newly
+  verified pieces when they are deselected, never writes a deselected file (a piece stored while
+  one is deselected keeps that file's span in its sidecar, which reads use while it is owned,
+  `storedInPlace`), copies verified spans of boundary pieces from the task's sidecar into newly
+  selected files and rehashes them, discards pieces no longer wanted without blaming the peer,
+  and revokes rather than fails on an unreadable piece outside the selection; a recheck heals a
+  piece from its sidecar into selected files only. v2 and hybrid create or recheck newly
   selected files, refuse one whose path holds a file they did not create, keep deselected
   verified pieces readable, and bind their creation log without the selection once it changes.
   A seeding task whose selection grows downloads again and seeds once more, the run that takes
@@ -1010,7 +1083,27 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   change until it holds, so a newer one applied meanwhile is never undone. A v2 or hybrid seeder
   missing a selected file fails as it opens, before any check (its checkpoint's ownership no
   longer holds), and keeps its intent: a drop saved between that read and the check takes effect
-  the next time seeding is restored. A lent seeder pays the global limit alone
+  the next time seeding is restored. A v1 seed-only session (`startSeeding`) whose check misses
+  only pieces it shares with deselected files that are gone, cut short, never in place or changed
+  since the store last knew them, the selected files whole and not known to have changed, sets them
+  aside (`TorrentPieceStore.setAsideLostPieces`): neither wanted, verified nor offered, and wanted
+  again at the next check or once the selection adds a file. Changed means another size or
+  modification time than the file's `TorrentFileStamp`, taken as the store writes a file and by a
+  check that verifies every wanted piece it holds, and saved in the checkpoint (`file-stamps`, 20
+  bytes a file, as the session's admission charges its resume data eight times over). A piece whose
+  selected file is known to have changed is never set aside, nor one whose deselected file only
+  changed while no stamp tells whether the selected file did; one whose deselected file is gone is
+  set aside even when nothing tells whether the selected file changed too, and a change that keeps a
+  file's size and modification time cannot be seen. It seeds the rest, logs a warning and keeps its
+  intent. Its store (`seedOnly`) sets a piece aside
+  the same way while its selection is complete when a peer's request finds it unreadable or
+  changed (`PieceRevokedException.setAside`, `TorrentPieceScheduler.setAside`), so it stays
+  SEEDING rather than downloading it; a lent seeder downloads such a piece again. A run that takes
+  a seed-only session over ends that mode (`TorrentSession.endSeedOnly`: a v1 session and its
+  store, a v2 or hybrid session), so it downloads what its selection misses, also while the
+  session checks its files, and seeds as a lent seeder once it completes; the `startSeeding` that
+  opened one still checking returns `ALREADY_ACTIVE` at once (`CheckingSeeder.takenOver`), so
+  restoring goes on. A lent seeder pays the global limit alone
   (`DownloadContext.globalThrottle`) should it fetch a piece again, and its discovery keeps only
   the spec fields it reads, so no finished run stays reachable.
   Trackers hear `completed` only once every file is selected and complete; admission charges
@@ -1028,7 +1121,9 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   once `Ketch.start()` attaches it, then each time the effective policy turns to seeding (uploads
   resume under `seed`, or a live switch to `seed`, which re-seeds kept intents at once). A task
   whose files changed on disk loses the intent, one a download, a pause of uploads or shutdown
-  stopped keeps it.
+  stopped keeps it. A lent seeder's watcher (`watchSeeder`) follows it until it stops or finishes:
+  one that downloads a piece it lost again (an edited file) leaves `seedingTaskIds` meanwhile and
+  is back once it seeds, saving its checkpoint and taking `changeSeedingSelection` throughout.
   `TorrentDownloadSource(..., restoreSeeding = false)`, as `ketch mcp --standalone` builds it,
   never restores, never bumps `sharingResumes` and never records deferred intents
 - Payload counters (`TorrentCounters`): received, uploaded and, of what was received,
@@ -1088,7 +1183,10 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   that another to the same peer replaced counts for the one kept, dialed again where we dialed the
   peer (v1 `PeerResult.alias`/`inherited`, v2 `Member.inherited`). A source naming a peer that
   brought payload again has it dialed `FOUND_AGAIN_MS` (30 s) after its last dial, at most once
-  every `FOUND_AGAIN_EVERY_MS` (5 minutes), as the DHT names the same peers every minute; named
+  every `FOUND_AGAIN_EVERY_MS` (5 minutes), as the DHT names the same peers every minute, unless
+  a connection to it counted as its first dial since; only a dial brought forward
+  `FOUND_AGAIN_MIN_GAIN_MS` (5 s) or more counts, so a naming during the 30 s wait, sooner by
+  just the time the last dial took, leaves the next wait its bring-forward; named
   while a dial of it runs, once that dial fails without connecting. A revive
   dials every waiting or given-up endpoint at once and keeps its count; its dial of an endpoint
   given up on leaves when that was (`PeerRedial.spent`), so a source naming it 5 minutes on still
@@ -1272,7 +1370,9 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   it; an owner that gives a copied block back leaves it to the copier, due and ordered as its copy
   was asked for. Each pass, `poll` hands a worker the requests to cancel (the
   other copy arrived, or the piece is done or unwanted), newly verified pieces for HAVEs (an
-  append-only log with a cursor per peer) and its interest: workers start not interested and send
+  append-only log with a cursor per peer, which also logs a piece revoked, `Poll.revoked`, so one
+  verified again is announced again, where `TorrentV2Uploader` announces each piece once) and its
+  interest: workers start not interested and send
   INTERESTED or NOT_INTERESTED as the peer's count of wanted, unverified pieces crosses zero. A
   swarm holding every piece closes connections to peers holding every piece and never redials
   them. A peer is admitted while everything the engine-wide budget holds but the swarm's own pieces
@@ -1288,7 +1388,12 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   until the peer rejects them; requests left unanswered for `FAST_REJECT_GRACE_MS` (5 s) are
   canceled. A rejected block is free for any peer at once; unchoked, the peer may ask for it
   again until it has rejected as many blocks of the piece as the piece has, then other peers
-  fetch it (`refused` until the peer unchokes us anew). We reject requests we will not serve (choked or uninterested peer, a piece we lack, a
+  fetch it (v1's `refused` until the peer unchokes us anew, announces the piece, sends a block of
+  it or `REFUSAL_MS`, a minute, passes; the scheduler hears of it, `TorrentPieceScheduler.refusing`,
+  and keeps it past the minute until one of the others, `probing`; `health` counts a wanted piece
+  every connected holder refuses as missing; v2 and hybrid lift `TorrentV2PeerView.refused` only
+  on an unchoke). We reject requests we will not serve
+  (choked or uninterested peer, a piece we lack, a
   full queue, a cancel), and while uploading offer IPv4 peers BEP 6's canonical allowed-fast set
   (`allowedFastSet`, k = 10, /24) and serve it while they are choked, within the upload limits.
   Fast messages on a connection that did not negotiate it close the peer. The v1 pipeline also
@@ -1829,6 +1934,9 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   task views carry it in `request` and the verified one in `Completed.checksum`; a mismatch is a
   `checksum_mismatch` error. `RemoteKetch.download` refuses a checksum for servers without
   `KetchFeatures.CHECKSUM`
+- `POST /api/tasks` answers a link no source handles with 415 `unsupported` ("No download source
+  handles this URL"), as the resolve routes do, telling it by the `NoDownloadSourceException`
+  cause of `Ketch.download`'s `IllegalArgumentException`; other refusals stay 400 `bad_request`
 - `PUT /api/config` keeps the server's value of every field the body leaves out (merged over
   the current config), as clients older than category folders or idle timeouts send it
 - JSON bodies are read with `receiveJson` (`application/json`, else 415): 1 MiB, 32 MiB for
@@ -1918,7 +2026,9 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   an older app's empty reply asks to update it), else the `ketch server` or
   `ketch mcp --standalone` that `instance.json` names, when its pid runs. Results go to stdout,
   everything else to stderr; exit 0, 1 on failure, 2 for invalid arguments (`InstanceExit`).
-  Task IDs may be shortened to a unique prefix
+  Task IDs may be shortened to a unique prefix. Without `-v` they log warnings only: the CLI's
+  `logback.xml` keeps Ktor's engine choice (logger `HttpClient`) at WARN, and `RemoteKetch`
+  logs the HTTP errors its callers get as exceptions at debug
 - `ketch add` sends a `requestId` (`--idempotency-key`: a UUID as it is, other text a name-based
   UUID) and sends it again, up to three times, when the connection fails or the instance answers
   5xx (`submitDownload`); a destination is made absolute for an instance on this machine.
@@ -1933,11 +2043,28 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   `sha512`, base64 or bare hex; `parseChecksumOption`), a malformed one exiting 2; `ketch add`
   refuses it for an instance without `KetchFeatures.CHECKSUM`, and task JSON carries `checksum`
   and `verifiedChecksum`
+- `ketch <url>` (`downloadUntilDone`) exits 0 once the download completes and 1 when it fails or
+  Ketch refuses it, such as a link no source handles, saying why on stderr in one line
+  (`failureReason`: `describeCauses()`, but `reason()` for `KetchError.Unsupported`, and a
+  `SourceError`'s `detail` followed by the causes from the first whose message differs from it).
+  It logs only warnings and errors unless -v or --debug asks for more (`quietLogLevel`, as
+  `--list-files`, `update` and the attaching commands do); only an unknown or disk failure's
+  record has a stack trace. Its progress line (`ProgressPrinter`), written over every second,
+  stays under 80 columns: while a torrent stalls it says only for how long, without speed or
+  limit, and a line above it says why each time the reason changes (`torrentStalls`, from
+  `TorrentInterest` snapshots, and `stallReason`). Log records go above it, as above
+  `ketch update`'s progress: `Logger.above(ProgressLine)` wraps the console logger, clearing the
+  line under a lock shared with the printer and drawing it again below each record. Only a
+  terminal is written over, and only while stdin is one too (`stdoutIsTerminal`:
+  `System.console()`, and `Console.isTerminal` from JDK 22, which check both); otherwise, as when
+  captured to a file or pipe or fed from one (`< urls.txt`), the progress goes on lines of its
+  own, one every 5 s at most, and records as they come
 - `ketch <url> --files <ids>` downloads only those files of a torrent
   (`DownloadRequest.selectedFileIds`); `ketch --list-files <url>` resolves the URL and prints
   `ID  SIZE  PATH` rows instead (`fileListRows`), in the order of `--sort name|size|type` (`type`
-  is the file extension) and `--reverse`, exiting 1 when it cannot list them. Invalid download
-  options, such as `--list-files` with `--files`, exit 2
+  is the file extension) and `--reverse`, exiting 1 when it cannot list them and saying why as
+  `ketch <url>` does (`failureReason`). Invalid download options, such as `--list-files` with
+  `--files`, exit 2
 - Koog's Anthropic, Gemini and OpenAI Responses clients have Ktor find their request and response
   serializers by class, and Gemini parts and Responses items use content-polymorphic serializers,
   so `ai:discover` registers those classes too; the Ollama and chat-completions clients do not
@@ -2180,7 +2307,11 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
 - HTTP threads (`library:ktor`, `HttpDispatcher.kt`): the clients `KtorHttpEngine` builds run on
   `ketch-http-N` daemon threads, started only when every one is busy and ended after 30 s idle:
   OkHttp (`httpDispatcher`), which reads each response body there while it streams, at most 256
-  at once (every JVM HTTPS request goes through it); CIO, whose selector, connections and name lookups run there, at most 8 per client
+  at once (every JVM HTTPS request goes through it), and whose call dispatcher lets as many
+  requests wait for their headers, to one host too (its defaults, 64 and 5 per host, held a
+  download's sixth segment request back; `okHttpClient()` in `OkHttpTransports.kt` builds every
+  OkHttp client, Android's under the system proxy too); CIO, whose
+  selector, connections and name lookups run there, at most 8 per client
   (`cioDispatcher()`, a slice of its own, as each client's selector keeps a thread of it), as a
   burst of its short tasks would otherwise start a thread each. Our apps cap the app-wide
   `Dispatchers.IO` at 16 (`kotlinx.coroutines.io.parallelism`) and idle workers at 10 s: the desktop
@@ -2236,7 +2367,13 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   `ai:discover`, mDNS and app code tag by component name (e.g. "DiscoveryService", "KetchService")
 - Levels: verbose (speed limiter waits and per-peer detail), debug (internal operations and
   segment start/finish), info (user events and state transitions), warn (retries, recoverable
-  problems), error (fatal)
+  problems), error (fatal). A failed download is a warning with its cause chain, an error with
+  its stack trace only when it is `KetchError.Unknown` or `Disk`, or a `SourceError` a bug
+  caused: its root cause is an `Error`, or a `RuntimeException` other than
+  `IllegalArgumentException` and cancellations, as a torrent's wrapping an
+  `IndexOutOfBoundsException` (the engines' `Network` and `Unsupported` errors with such causes,
+  for a server or platform that falls short, stay warnings). An input no source takes is logged
+  at debug, as its caller is told
 - Include `taskId=` in every task-scoped message; torrent engine code also uses `logHash()`
 - Never log credentials: pass URLs through `redactUrl()`, tracker URLs through
   `trackerLabel()`, and describe tracker errors with `describeWithoutUrls()`

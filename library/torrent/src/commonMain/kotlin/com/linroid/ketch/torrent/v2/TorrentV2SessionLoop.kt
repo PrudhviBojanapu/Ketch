@@ -7,6 +7,7 @@ import com.linroid.ketch.torrent.api.TorrentStall
 import com.linroid.ketch.torrent.describeWithoutUrls
 import com.linroid.ketch.torrent.engine.StallRecovery
 import com.linroid.ketch.torrent.engine.StallSignals
+import com.linroid.ketch.torrent.engine.ThrottleClock
 import com.linroid.ketch.torrent.engine.TorrentBufferBudget
 import com.linroid.ketch.torrent.engine.TorrentRateLimiter
 import com.linroid.ketch.torrent.engine.TorrentStallWatchdog
@@ -113,8 +114,11 @@ internal class TorrentV2Swarm(
   val stall: MutableStateFlow<TorrentStall?>? = null,
   /** Asks the torrent's trackers for peers now, as a stalled download recovers; never waits. */
   val reannounce: () -> Unit = {},
-  /** Time this transfer's web seeds spent waiting on speed limits so far, which is no stall. */
-  val webSeedThrottledMs: () -> Long = { 0 },
+  /**
+   * Time this transfer spent waiting on speed limits, which is no stall: its web seeds' waits,
+   * and the loop's while a peer's request waits. Null keeps the loop's own, on its clock.
+   */
+  val throttle: ThrottleClock? = null,
 )
 
 /** Serializes session decisions while peer actors and the storage worker perform their own I/O. */
@@ -257,6 +261,12 @@ internal object TorrentV2SessionLoop {
     val members = linkedMapOf<PeerV2Pool.Peer, Member>()
     // How each connection of a swarm ended: the same report v1 swarms log.
     val diagnostics = swarm?.let { PeerDiagnostics(listener = it.runtime.peerOutcomes) }
+    // Time spent waiting on speed limits, which is never a stall: while a peer's request waits,
+    // the loop counts as one wait, unless the peer rejected a piece's worth of blocks since the
+    // last one it delivered.
+    val throttle = swarm?.throttle ?: ThrottleClock(nowMs)
+    var requestsWaiting = false
+    val pieceBlocks = ((layout.pieceLength + PeerWire.BLOCK_SIZE - 1) / PeerWire.BLOCK_SIZE).toInt()
     try {
       val pieces = checkNotNull(TorrentV2PieceScheduler.create(layout, selectedIds,
         store.verifiedPieces(), buffers, state, maxActive, nowMs,
@@ -318,8 +328,6 @@ internal object TorrentV2SessionLoop {
       val watchdog = swarm?.stall?.let { TorrentStallWatchdog(nowMs) }
       // Payload received from peers; stall checks count web seeds' in [mirrors].
       var peerPayload = 0L
-      // Time requests waited on speed limits, which is never a stall.
-      var throttledMs = 0L
 
       fun wakeAdmission() { peers.values.forEach { it.admissionBlocked = false } }
 
@@ -413,7 +421,6 @@ internal object TorrentV2SessionLoop {
             if (delay > 0) {
               check(pieces.resolve(request, null))
               view.rateRetryAt = nowMs() + delay
-              throttledMs += delay
             } else if (sent) {
               view.inFlight++
             } else {
@@ -421,6 +428,15 @@ internal object TorrentV2SessionLoop {
               view.admissionBlocked = true
             }
           }
+        }
+        // The loop wakes when the first delayed request is due, so a wait runs pump to pump. A
+        // peer that answers only with rejects would hide a stall for as long as it does.
+        val waiting = peers.values.any {
+          it.rateRetryAt != 0L && it.rejectsSinceBlock < pieceBlocks
+        }
+        if (waiting != requestsWaiting) {
+          if (waiting) throttle.enter() else throttle.exit()
+          requestsWaiting = waiting
         }
         if (mirrors != null && idleMirrors.isNotEmpty() && !complete &&
           (pieces.version != mirrorVersion || nowMs() >= mirrorRetryAt)) {
@@ -496,6 +512,7 @@ internal object TorrentV2SessionLoop {
       fun rejected(view: TorrentV2PeerView, response: PeerBlockExchange.Response.Rejected) {
         val index = response.ticket.request.index
         if (view.choked && index !in view.allowedFast) return
+        view.rejectsSinceBlock++
         val count = (view.rejects[index] ?: 0) + 1
         val blocks = (layout.v2Piece(index.toLong()).length + PeerWire.BLOCK_SIZE - 1) /
           PeerWire.BLOCK_SIZE
@@ -593,6 +610,7 @@ internal object TorrentV2SessionLoop {
             val block = value.value as? PeerBlockExchange.Response.Block
             (value.value as? PeerBlockExchange.Response.Rejected)?.let { rejected(view, it) }
             if (block != null) {
+              view.rejectsSinceBlock = 0
               store.recordReceived(block.ticket.request.length)
               peerPayload += block.ticket.request.length
               // What crossed the wire: on a v1 route, the canonical block with its padding.
@@ -882,7 +900,7 @@ internal object TorrentV2SessionLoop {
           droppedWebSeeds = stoppedMirrors.size,
           peerPayloadBytes = peerPayload,
           webSeedPayload = mirrors?.checkPayload() ?: WebSeedLedger(checks = 0, arrived = 0),
-          throttledMs = throttledMs + swarm.webSeedThrottledMs(),
+          throttledMs = throttle.throttledMs(),
           pieceLength = layout.pieceLength,
         ))
         val current = stallWatchdog.stall
@@ -1243,6 +1261,7 @@ internal object TorrentV2SessionLoop {
           diagnostics.record(member.endpoint, member.attempt, null, member.incoming, member.flags)
         }
       }
+      if (requestsWaiting) throttle.exit()
       peers.values.forEach { it.close() }
       resets.forEach { it.done.complete(Unit) }
       uploader?.close()

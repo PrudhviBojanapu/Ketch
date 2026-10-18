@@ -28,8 +28,8 @@ import com.linroid.ketch.torrent.webseed.WebSeedLedger
  *   ([com.linroid.ketch.torrent.webseed.WebSeedStats.checked], which also marks this check): what
  *   arrived since, and what was stored or thrown away of what arrived before, by the check that
  *   counted it.
- * @property throttledMs time spent so far waiting on speed limits, which is never a stall: the
- *   waits of every peer added up, of which a check counts at most the time since the last.
+ * @property throttledMs time so far during which payload waited on speed limits, which is never
+ *   a stall ([ThrottleClock]): waits that overlap count once, and a wait counts as it passes.
  * @property pieceLength the torrent's piece length.
  */
 internal data class StallSignals(
@@ -70,7 +70,8 @@ internal enum class StallRecovery {
  * seeds tell each check what it counted ([StallSignals.webSeedPayload]), so the bytes of a piece
  * thrown away are taken back from the checks that counted them and no other. But a gap is told
  * from when any payload last arrived, so payload thrown away never makes the next look back after
- * one. Time spent waiting on speed limits counts as progress: a slow limit is no stall.
+ * one. Time spent waiting on speed limits counts as progress, as it passes, also for payload
+ * later thrown away ([waited]): a slow limit is no stall.
  * Recoveries start once it has lasted [RECOVER_AFTER_MS], each at most once per its own cooldown,
  * announcing to trackers less often each time it does not help. Pieces missing while a peer or
  * web seed was connected stay missing for [SOURCE_GRACE_MS] once the last one goes, so a peer that
@@ -148,8 +149,8 @@ internal class TorrentStallWatchdog(private val nowMs: () -> Long) {
     val seeds = signals.webSeedPayload
     val received = fromPeers + seeds.arrived
     val wasted = seeds.wasted.values.sum()
-    // Peers wait on the limits side by side, each adding its own wait: at most the time that
-    // passed counts.
+    // Waits count as they pass, so this is the time since the last check that something waited;
+    // never more than the time that passed.
     val throttled = (signals.throttledMs - throttledMs).coerceIn(0, elapsed)
     throttledMs = signals.throttledMs
     rate = (rate + (received - wasted).coerceAtLeast(0) * 1000.0 / elapsed) / 2
@@ -222,7 +223,22 @@ internal class TorrentStallWatchdog(private val nowMs: () -> Long) {
     return due
   }
 
-  /** Time spent waiting on speed limits counts as progress, also for the checks taken back. */
+  /**
+   * Time spent waiting on speed limits counts as progress, also for the checks taken back. It
+   * counts as it passes, before anything shows whether what waits is kept: a web seed's bytes
+   * wait once they arrived, a v2 peer's requests before they are sent. It is not taken back when
+   * that payload is thrown away or never comes: waits overlap, a peer's among them, and these
+   * times moved since, so nothing says how much to take back, and too much would show a slow
+   * limit as a stall again. So a web seed sending only corrupt pieces under a limit that holds
+   * each for T shows a stall once it is dropped after
+   * [MAX_FAILURES][com.linroid.ketch.torrent.webseed.WebSeedWorker.MAX_FAILURES] runs, about 5 T,
+   * and within [NO_PAYLOAD_MS] of that: some 7.5 minutes for 256 KiB pieces at 3 KiB/s, though
+   * its first corrupt piece is known within 1.5. While a seed started again waits, the stall does
+   * not age. A v2 download whose peer stops answering stalls once no request waits: once the peer
+   * is dropped for answering none of its requests for a minute, or sooner when nothing is left to
+   * ask it. A v2 peer's requests count as waiting until it rejected a piece's worth of blocks since
+   * the last one it delivered.
+   */
   private fun waited(throttled: Long, now: Long) {
     progressAt = minOf(progressAt + throttled, now)
     pieceAt = minOf(pieceAt + throttled, now)

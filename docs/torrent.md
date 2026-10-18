@@ -51,7 +51,10 @@ ketch --files 0,2,5 'magnet:?xt=urn:btih:...'
 `--list-files` prints `ID  SIZE  PATH` rows. Sort them with `--sort name|size|type` (`type` is the
 file extension) and `--reverse`. `ketch <url>` uploads to peers while it downloads, unless
 `[torrent] upload = "off"`, and exits once its downloads finish; it does not seed. To keep seeding,
-run [`ketch server`](#seeding-and-uploading).
+run [`ketch server`](#seeding-and-uploading). While a download makes no progress, its progress line
+says for how long (`stalled 2m 30s`), and a line above it says why each time the reason changes,
+such as `[Stalled] No peers, still looking` (see [stalls](#when-a-download-stops-making-progress));
+`ketch <url>` logs only warnings, so `-v` also shows the stall, peer and recovery messages.
 
 ### Where the files go
 
@@ -119,8 +122,8 @@ hybrid torrents alike:
 What happens next depends on the task's state:
 
 - **Downloading**: the torrent switches without reconnecting to its peers. Newly chosen files are
-  created and downloaded. Files you deselect stop downloading but stay on disk as they are, with
-  their verified pieces.
+  created and downloaded. Files you deselect stop downloading and stay on disk as they are, with
+  their verified pieces: Ketch never writes to them again.
 - **Paused, queued, scheduled or failed**: the new selection applies when the task starts. On a
   paused task, a file you deselected after it last started and choose again shows at once the
   pieces that run verified; otherwise a file shows its pieces once the task starts and checks
@@ -132,6 +135,20 @@ What happens next depends on the task's state:
   one you deleted before removing it no longer keeps the task from seeding. A v2 or hybrid
   torrent that still has a deleted file selected cannot start seeding again, though; removing
   that file then lets it seed the next time Ketch restores seeding, such as when it starts again.
+  In a v1 torrent a file usually shares its first and last pieces with the files beside it, and a
+  file you removed keeps its part of them; Ketch never writes to it again. If you delete or change
+  it, before or after removing it, the shared pieces that no longer verify are set aside: the task
+  never offers them, seeds every other piece of the files you kept and keeps seeding. Ketch tells
+  which file changed from each file's size and modification time, noted as it writes and checks
+  them, so it cannot see a change that keeps both. A shared piece that fails because a file you kept
+  is known to have changed is never set aside, nor one where a file you removed changed but nothing
+  tells whether the file you kept did too: the task does not start seeding, or downloads the piece
+  again if it seeds. One whose removed file is gone is set aside even when nothing tells whether the
+  file you kept changed too. Seeding finds them as it checks its files, or as a peer asks for one; a
+  task still seeding straight after its own download downloads such a piece again instead, then
+  seeds on; removing files meanwhile applies at once. Choosing
+  that file again, or any other, downloads those pieces again: a file you chose is filled in, and
+  one still removed keeps its part in the task's hidden sidecar and stays as you left it.
 
 Choosing the current files again does nothing, and an empty selection is refused. Ketch checks the
 IDs against the torrent's metadata it saved for the task, never against sizes a client sent.
@@ -204,7 +221,9 @@ complete. Seeding stops when:
 - Ketch quits.
 
 A seeder stopped by the mode, by paused uploads, by a waiting download or by quitting seeds again
-later; one you stop, or whose files changed on disk, does not.
+later; one you stop, or whose chosen files changed on disk, does not. In a v1 torrent, a file
+you removed that changed only sets aside the pieces it shares with the others (see
+[Choosing files](#choosing-files)).
 
 ### Only on Wi-Fi
 
@@ -372,7 +391,7 @@ Torrent tasks follow the same download settings as HTTP and FTP tasks, with thes
 | Setting | Torrent behavior |
 | --- | --- |
 | Simultaneous downloads | Ketch's queue starts torrents like other tasks. The engine also runs at most 5 torrents at once, seeding included. Further torrents wait for a slot as downloading at 0 B/s; they can be paused or canceled at once and start by priority, then arrival order. A seeder gives its slot to a waiting download. |
-| Speed limits | Global and per-task limits apply to torrents too, live, also after a seeding task reopens to download files added to it. A torrent that keeps seeding right after its download follows the global limit should it have to fetch a piece again; one Ketch starts seeding again later, as after a restart, does not. |
+| Speed limits | Global and per-task limits apply to torrents too, live, also after a seeding task reopens to download files added to it. A torrent that keeps seeding right after its download follows the global limit should it have to fetch a piece again; one Ketch starts seeding again later, as after a restart, does not. Under a low limit a v2 or hybrid torrent receives a 16 KiB block at a time, seconds apart; its speed is measured across several blocks, so it reads near the limit. |
 | Connections per task | The task's peer limit, applied live, clamped to 1-512 (v1) or 1-500 (v2). Auto (0) means 100 peers. |
 | Connections per download | Not used: it counts HTTP segments. The engine opens at most 200 peer connections across all torrents. |
 | Priority | Orders the queue and the wait for an engine slot. |
@@ -460,10 +479,18 @@ ketch.shutdown() // waits while seeding sessions tell their trackers they stoppe
 ```
 
 An empty `selectedFileIds` downloads every file. File IDs keep their index in the metainfo, so the
-IDs of a torrent with padding files, such as a hybrid, have gaps where the padding is left out.
+IDs of a torrent with padding files, such as a hybrid, have gaps where the padding is left out. An
+ID the torrent does not list, a padding file's included, is refused at once when the request
+carries the resolution; otherwise the download fails with a `KetchError.SourceError` naming it.
 
 `KetchApi.resolve` waits until a magnet's metadata is found or the caller cancels it; bound it with
 `withTimeout` if you need to. Up to 16 magnet lookups run at once; more wait for one to finish.
+A lookup stops once nothing waits for it: its task paused, canceled or removed, or its preview
+given up. A btih magnet's lookup of the torrent's info goes on for 5 seconds first, so a task
+resumed, or a previewed link added, meanwhile carries on with it and the peers it found. A link
+naming a tracker or peer that lookup does not ask ends it at once and looks up the torrent anew.
+A btmh magnet's lookup, and the lookup of a hybrid torrent's piece layers that follows a btih
+one, stop at once, so a task resumed starts them over.
 
 `TorrentDownloadSource` takes:
 
@@ -617,12 +644,15 @@ This section describes the engine's protocol behavior for people who debug swarm
 - **Trackers**: HTTP(S) and UDP trackers, with tiers, IPv4 and IPv6, lifecycle events and
   failover. Extra trackers are announced alongside the torrent's own rather than as a later tier.
   Trackers of other schemes, such as WebTorrent's `wss://`, are skipped. A torrent that stops
-  gives its trackers 2 seconds to hear it. When Ketch shuts down, every torrent shares one such
+  gives its trackers 2 seconds to hear it, in the background: canceling, pausing or removing it
+  takes effect at once. Started again meanwhile, it announces itself to them only once they
+  heard it stop, or the 2 seconds are up. A magnet's tracker-only metadata lookup says goodbye
+  the same way. When Ketch shuts down, every torrent shares one such
   window, from the moment it begins, while the router removes the port mappings: downloading
   torrents pause and seeding ones stop side by side, each seeder saving its state while it says
   goodbye and again once it has, so slow trackers and routers hold the shutdown up for about 2
   seconds and a slow disk still saves before Ketch's host exits. The engine then stops what is
-  left, within what remains of the window.
+  left, magnet lookups included, within what remains of the window.
 - **DHT**: public torrents look up peers in the DHT. With a `stateDirectory`, routing candidates
   are saved, so a restart reaches known nodes even where the bootstrap names do not resolve. Peers
   of public torrents exchange DHT ports (BEP 5 `PORT`), and Ketch pings the nodes they name, so the
@@ -658,10 +688,12 @@ This section describes the engine's protocol behavior for people who debug swarm
   times, over about half an hour, so a peer that restarts is reached again; then it is given up the
   same way. A connection that sent data or stayed up five minutes starts the count over. A tracker,
   the DHT, peer exchange or local discovery naming a peer that sent data again has it dialed 30
-  seconds after its last dial, at most once every five minutes, also when it names the peer while
-  a dial of it runs and that dial then fails. A stalled download with no peer at
-  all dials every peer it knows again every minute, also ones a source named only once, such as a
-  magnet's peers. A seeding torrent dials nobody back.
+  seconds after its last dial, at most once every five minutes unless it sent data since, also
+  when it names the peer while a dial of it runs and that dial then fails. A naming that would
+  bring the dial less than five seconds forward does not count against those five minutes.
+  A stalled download
+  with no peer at all dials every peer it knows again every minute, also ones a source named only
+  once, such as a magnet's peers. A seeding torrent dials nobody back.
 - **One connection per peer**: a peer reached at two addresses, such as loopback from a magnet's
   `x.pe` and its LAN address from local discovery, or dialed while it dials Ketch, keeps one
   connection, and both ends agree which: of two dialed the same way the first, otherwise the one the
@@ -827,7 +859,15 @@ answering anything, and a request it never answers is given up after four.
 
 Each download checks itself every second. It has stalled once no payload arrived for 30 seconds,
 or no piece verified for four pieces' worth of time at its rate (between one and ten minutes);
-time spent waiting on a speed limit never counts. Payload thrown away, such as a web seed's piece
+time spent waiting on a speed limit never counts, also while a low limit holds a block for longer
+than a check. That time counts as it passes, before Ketch knows whether what waits will be kept,
+and is not taken back when it is not: a web seed sending only corrupt pieces under a limit that
+holds each for about a minute and a half (256 KiB at 3 KiB/s) shows a stall once Ketch drops it
+after five failed runs, some seven and a half minutes in. A v2 download whose peer stops answering
+shows one once none of its requests waits: once Ketch drops the peer for answering none of them
+for a minute, or sooner when nothing is left to ask it. The requests of a v2 peer that rejected a
+piece's worth of blocks since the last one it sent count as waiting no more, so a peer that
+rejects everything hides a stall only that long. Payload thrown away, such as a web seed's piece
 that fails its hash check, is no payload. Ketch notes which check counted each byte a web seed
 sends, so the bytes of a piece it throws away are taken back from the checks they arrived in, and
 never another source's payload. What arrives with them, such as the next piece's first bytes,
@@ -838,7 +878,9 @@ says why, in the most telling order:
 
 - **Missing pieces**: wanted pieces that no connected peer or running web seed has and every web
   seed that stopped could not serve, as it may serve the rest once started again, and the files they
-  belong to; with nothing connected and no such seed, none. A web seed started again counts as it
+  belong to; with nothing connected and no such seed, none. In a v1 torrent, a piece every
+  connected peer that has it refused is missing too, until one of them sends some of it, announces
+  it again or unchokes Ketch again. A web seed started again counts as it
   did while stopped until it answers, by sending data or by serving or refusing a piece, as it
   offers every piece meanwhile: a mirror retried for minutes hides no more than it did while
   stopped, and a peer that has the missing pieces clears them at once while one that lacks them does
@@ -876,21 +918,29 @@ Every connection, v1, v2 and hybrid, negotiates the Fast extension (BEP 6): Have
 rejected rather than dropped requests, a choke that leaves requests to be rejected (those still
 unanswered after 5 seconds are canceled), and allowed-fast pieces requested and served while
 choked. While it uploads, Ketch offers IPv4 peers BEP 6's set of 10 allowed-fast pieces. A rejected
-block goes to other peers without counting against the peer. A torrent at its peer limit closes
-peers that dial it before answering their handshake.
+block goes to other peers without counting against the peer. A piece a peer rejects block by
+block is left to other peers until that peer unchokes Ketch again, and in a v1 torrent also until
+it announces the piece again, sends some of it or a minute passes. A v1 torrent announces a piece
+it lost and verified again, such as one of a file you edited, so its peers ask for it again; v2
+and hybrid torrents announce each piece once. A torrent at its peer limit closes peers that dial
+it before answering their handshake.
 
 ### Partial selections
 
-In v1, a piece that spans a selected and a skipped file needs all its bytes to be verified. The
-skipped file's part is kept in a hidden sidecar for the task, not in the skipped file. When that
-file is chosen later, its verified bytes are copied from the sidecar and rechecked. A v2 or hybrid
-task refuses a newly chosen file whose path holds a file it did not create.
+In v1, a piece that spans a selected and a skipped file needs all its bytes to be verified. A piece
+stored after the file was skipped keeps the skipped file's part in a hidden sidecar for the task,
+not in the file: Ketch never writes a skipped file. A piece verified before you skipped it still
+reads that part from the file itself, so deleting or changing the file loses the piece (see
+[choosing files](#choosing-files)). When that file is chosen later, its verified bytes are copied
+from the sidecar and rechecked. A v2 or hybrid task refuses a newly chosen file whose path holds a
+file it did not create.
 
 ## Storage, restart and compatibility
 
 Data is verified before it is written as complete. Checkpoints record the metainfo, the selection
-and which files the task owns, and a restart rehashes the data rather than trusting a saved bitmap.
-Configure a durable `TaskStore` (such as `SqliteTaskStore`) to keep tasks across restarts.
+and which files the task owns (in v1, also each file's size and modification time as Ketch last
+knew it), and a restart rehashes the data rather than trusting a saved bitmap. Configure a
+durable `TaskStore` (such as `SqliteTaskStore`) to keep tasks across restarts.
 
 - File identities and an append-only ownership journal stop cleanup from deleting files that
   existed before the download or were replaced. A v1 task keeps them, its checkpoint and the
@@ -900,6 +950,10 @@ Configure a durable `TaskStore` (such as `SqliteTaskStore`) to keep tasks across
   keeps the downloaded files, and so does `ketch <url>` once its download ends. It is published with a hard link, or, on
   file systems without them (FAT, exFAT and some network shares), by claiming its name with an
   empty file and moving the written log over it, so an existing log is never replaced.
+- Canceling a torrent stops it and deletes nothing, unlike the partial file of an HTTP, FTP, HLS
+  or DASH download: its files and its hidden `.ketch-` files stay on disk until the task is
+  removed. Removing it with its files (`remove(deleteFiles = true)`) deletes the files it created
+  and the hidden ones; removing it without them deletes only the hidden ones.
 - Payload I/O opens files through their parent folder without following symlinks. Do not let an
   untrusted process change the destination during cleanup: checking a file and deleting it are not
   one atomic operation. A crash between creating a file and recording it may leave a file no task

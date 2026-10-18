@@ -7,11 +7,13 @@ import com.linroid.ketch.torrent.TorrentUploadPolicy
 import com.linroid.ketch.torrent.api.TorrentStall
 import com.linroid.ketch.torrent.describeWithoutUrls
 import com.linroid.ketch.torrent.engine.IncompleteSeedException
+import com.linroid.ketch.torrent.engine.ThrottleClock
 import com.linroid.ketch.torrent.engine.TorrentBufferBudget
 import com.linroid.ketch.torrent.engine.TorrentPayloadCounters
 import com.linroid.ketch.torrent.engine.TorrentRateLimiter
 import com.linroid.ketch.torrent.engine.TorrentSession
 import com.linroid.ketch.torrent.engine.TorrentSessionState
+import com.linroid.ketch.torrent.engine.waiting
 import com.linroid.ketch.torrent.logHash
 import com.linroid.ketch.torrent.metainfo.TorrentContentLayout
 import com.linroid.ketch.torrent.metainfo.TorrentV2Document
@@ -62,6 +64,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okio.ByteString
+import kotlin.concurrent.Volatile
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.AtomicReference
@@ -121,7 +124,8 @@ internal class TorrentV2SessionOptions(
   val discovery: suspend (TorrentV2DiscoverySink) -> Unit = { awaitCancellation() },
   /**
    * Only seed: when the file check finds the selection incomplete, stop with
-   * [IncompleteSeedException] before any discovery instead of downloading.
+   * [IncompleteSeedException] before any discovery instead of downloading, until a download run
+   * takes the session over ([TorrentV2DownloadSession.endSeedOnly]).
    */
   val seedOnly: Boolean = false,
   /**
@@ -205,7 +209,8 @@ internal class TorrentV2DownloadSession private constructor(
   private val discover = options.discovery
   private val privacy = options.privacy
   private val waitForPeers = options.waitForPeers
-  private val seedOnly = options.seedOnly
+  // Cleared by [endSeedOnly]; read after each check.
+  @Volatile private var seedOnly = options.seedOnly
   private val reporter = options.connections
   private val webSeedRetryMs = options.webSeedRetryMs
   private val nowMs = options.nowMs
@@ -374,6 +379,12 @@ internal class TorrentV2DownloadSession private constructor(
 
   /** This owner's upload bucket, applied after the engine's; zero means unlimited. */
   override fun setUploadRateLimit(bytesPerSecond: Long) = uploadRate.set(bytesPerSecond)
+
+  override fun endSeedOnly() {
+    if (!seedOnly) return
+    seedOnly = false
+    log.d { "Torrent $label downloads from now on what its selection misses" }
+  }
 
   /**
    * The runtime's upload policy changed: the running transfer chokes or unchokes peers within one
@@ -634,17 +645,17 @@ internal class TorrentV2DownloadSession private constructor(
       for (done in selections) loopControls.send(TorrentV2SessionLoop.Control.Select(done))
     }
     // Mirrors pay the same limits as peers: the engine's, this owner's, then the task's. The
-    // time they wait for them is no stall.
-    val webSeedThrottled = AtomicLong(0)
+    // time they wait for them is no stall, nor is the time peers' requests wait (the loop's).
+    val throttle = ThrottleClock(nowMs)
     val webSeeds = TorrentV2WebSeeds.of(document, layout, store, runtime.webSeedHttp, reporter,
       label, webSeedRetryMs) { bytes ->
       // Received before it waits, so a stop meanwhile leaves it to be counted as discarded.
       store.recordReceived(bytes)
-      val start = clock()
-      globalRate.acquire(bytes)
-      downloadRate.acquire(bytes)
-      taskThrottle.load()(bytes)
-      webSeedThrottled.addAndFetch(clock() - start)
+      throttle.waiting {
+        globalRate.acquire(bytes)
+        downloadRate.acquire(bytes)
+        taskThrottle.load()(bytes)
+      }
     }
     val mirrors = webSeeds?.let { launch { it.run() } }
     try {
@@ -711,7 +722,7 @@ internal class TorrentV2DownloadSession private constructor(
                   onRoom = room::store, onIncomplete = ::incomplete,
                   incomingFailures = incomingFailures, webSeeds = webSeeds,
                   stall = mutableStall, reannounce = { reannounces.addAndFetch(1) },
-                  webSeedThrottledMs = webSeedThrottled::load))
+                  throttle = throttle))
             }
           }
         }

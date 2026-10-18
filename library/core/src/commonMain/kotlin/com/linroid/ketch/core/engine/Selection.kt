@@ -1,5 +1,6 @@
 package com.linroid.ketch.core.engine
 
+import com.linroid.ketch.api.InternalKetchApi
 import com.linroid.ketch.api.ResolvedSource
 import com.linroid.ketch.api.Segment
 
@@ -66,3 +67,21 @@ class SelectionPlan(
 
 /** Why a selection of several files is refused for a source offering a single choice. */
 internal const val SINGLE_CHOICE_MESSAGE: String = "Choose exactly one variant of this download"
+
+/**
+ * Why a selection naming [ids], which the source does not list, is refused: the first few of
+ * them, cut short and without control characters, as callers may send anything. Sources that
+ * plan selections ([DownloadSource.planSelection]) refuse unknown IDs with it too.
+ */
+@InternalKetchApi
+fun unknownFilesMessage(ids: Collection<String>): String {
+  val named = ids.take(NAMED_FILE_IDS).joinToString { id ->
+    id.take(NAMED_FILE_ID_LENGTH).filterNot { it.isISOControl() }
+  }
+  val more = ids.size - NAMED_FILE_IDS
+  val label = if (ids.size == 1) "Unknown file ID" else "Unknown file IDs"
+  return "$label: $named" + if (more > 0) " and $more more" else ""
+}
+
+private const val NAMED_FILE_IDS = 5
+private const val NAMED_FILE_ID_LENGTH = 32

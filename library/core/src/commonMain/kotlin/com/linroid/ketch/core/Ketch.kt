@@ -20,6 +20,7 @@ import com.linroid.ketch.api.KetchStats
 import com.linroid.ketch.api.KetchStatus
 import com.linroid.ketch.api.NetworkInterfaceConfig
 import com.linroid.ketch.api.NetworkInterfaces
+import com.linroid.ketch.api.NoDownloadSourceException
 import com.linroid.ketch.api.PauseReason
 import com.linroid.ketch.api.Proxy
 import com.linroid.ketch.api.ResolveInput
@@ -53,6 +54,7 @@ import com.linroid.ketch.core.engine.SourceState
 import com.linroid.ketch.core.engine.SpeedLimiter
 import com.linroid.ketch.core.engine.TokenBucket
 import com.linroid.ketch.core.engine.decodeState
+import com.linroid.ketch.core.engine.unknownFilesMessage
 import com.linroid.ketch.core.file.DefaultFileNameResolver
 import com.linroid.ketch.core.file.FileNameResolver
 import com.linroid.ketch.core.geo.CountryLookup
@@ -247,9 +249,11 @@ class Ketch(
    * The task may be queued if the maximum number of concurrent
    * downloads has been reached.
    *
-   * @throws IllegalArgumentException if a header in [DownloadRequest.headers] cannot be sent
-   *   (see [RequestHeaders.requireValid]), or the request selects several variants of a
-   *   [DownloadRequest.resolvedSource] offering a single choice
+   * @throws IllegalArgumentException if no download source handles the link, caused by a
+   *   [NoDownloadSourceException]; if a header in [DownloadRequest.headers] cannot be sent
+   *   (see [RequestHeaders.requireValid]); or if the request selects files its
+   *   [DownloadRequest.resolvedSource] does not list, or several variants of one offering a
+   *   single choice
    */
   override suspend fun download(request: DownloadRequest): DownloadTask {
     RequestHeaders.requireValid(request.headers)
@@ -257,16 +261,24 @@ class Ketch(
     // resolved request starts with the source of its type, as a source that only takes content
     // resolves to a link it need not handle.
     val resolved = request.resolvedSource
-    require(
-      if (resolved != null) sourceResolver.hasType(resolved.sourceType, resolved.url)
-      else sourceResolver.canHandle(request.url)
-    ) { "No download source handles this link: ${redactUrl(request.url)}" }
+    val handled = if (resolved != null) {
+      sourceResolver.hasType(resolved.sourceType, resolved.url)
+    } else {
+      sourceResolver.canHandle(request.url)
+    }
+    if (!handled) {
+      throw IllegalArgumentException(
+        "No download source handles this link: ${redactUrl(request.url)}",
+        NoDownloadSourceException(),
+      )
+    }
     requireProxySupport(request.proxy)
     requireChecksumSupport(request)
     require(
       request.resolvedSource?.selectionMode != FileSelectionMode.SINGLE ||
         request.selectedFileIds.size <= 1
     ) { SINGLE_CHOICE_MESSAGE }
+    requireListedFiles(request)
     if (request.requestId == null) return createDownload(request)
     return submissionsMutex.withLock {
       val existing = tasks.value.find { it.request.requestId == request.requestId }
@@ -357,7 +369,14 @@ class Ketch(
   }
 
   private val taskController = object : TaskController {
+    // Finished even when the caller is cancelled while the task stops, as a REST client that
+    // leaves is: stopped but still holding its slot, the task would keep every waiting task out
+    // of it, and its resume would do nothing.
     override suspend fun pause(handle: TaskHandle) {
+      withContext(NonCancellable) { pauseTask(handle) }
+    }
+
+    private suspend fun pauseTask(handle: TaskHandle) {
       val taskId = handle.taskId
       coordinator.pause(taskId)
       queue.dequeue(taskId)
@@ -366,18 +385,20 @@ class Ketch(
       val state = handle.mutableState.value
       if (state !is DownloadState.Queued && state !is DownloadState.Paused) return
       // A task still waiting for a slot, or stopped before it saved any segments,
-      // must not restart on its own after a restart.
+      // must not restart on its own after a restart. A cancel landing meanwhile, which never
+      // waits for a pause, keeps the task canceled.
       val record = handle.record.value
       if (record.state != TaskState.PAUSED) {
         handle.record.update {
-          it.copy(state = TaskState.PAUSED, updatedAt = Clock.System.now())
+          if (it.state == TaskState.CANCELED) it
+          else it.copy(state = TaskState.PAUSED, updatedAt = Clock.System.now())
         }
       }
       if (state is DownloadState.Queued) {
-        handle.mutableState.value = DownloadState.Paused(record.savedProgress())
+        handle.mutableState.compareAndSet(state, DownloadState.Paused(record.savedProgress()))
       } else if (state is DownloadState.Paused && state.reason is PauseReason.Preempted) {
         // It waited in the queue; dequeue above took it out, so it now stays paused.
-        handle.mutableState.value = state.copy(reason = PauseReason.User)
+        handle.mutableState.compareAndSet(state, state.copy(reason = PauseReason.User))
       }
     }
 
@@ -404,6 +425,8 @@ class Ketch(
       val taskId = handle.taskId
       scheduler.cancel(taskId)
       coordinator.cancel(handle, deletePartialFile = true)
+      // A reschedule may have launched a wait as the cancel landed; none launches from now on.
+      scheduler.cancel(taskId)
       queue.dequeue(taskId)
     }
 
@@ -412,6 +435,7 @@ class Ketch(
       log.i { "Removing task: taskId=$taskId, deleteFiles=$deleteFiles" }
       scheduler.cancel(taskId)
       coordinator.cancel(handle, deletePartialFile = deleteFiles)
+      scheduler.cancel(taskId)
       queue.dequeue(taskId)
       try {
         coordinator.cleanup(handle, deleteFiles)
@@ -421,11 +445,13 @@ class Ketch(
         log.w(e) { "Cleanup failed for taskId=$taskId" }
       }
       connectionRegistry.closeTask(taskId)
-      taskStore.remove(taskId)
-      monitorMutex.withLock { taskMonitors.remove(taskId)?.cancel() }
+      // Deleted after any save in progress, and nothing saves the record again: a late writer,
+      // such as a source saving its state, never brings the task back after a restart.
+      handle.record.close { taskStore.remove(taskId) }
       tasksMutex.withLock {
         _tasks.value = _tasks.value.filter { it.taskId != taskId }
       }
+      monitorMutex.withLock { taskMonitors.remove(taskId)?.cancel() }
     }
 
     override suspend fun setSpeedLimit(taskId: String, limit: SpeedLimit) {
@@ -506,17 +532,21 @@ class Ketch(
       schedule: DownloadSchedule,
       conditions: List<DownloadCondition>,
     ) {
-      val state = handle.mutableState.value
+      val taskId = handle.taskId
       log.i {
-        "Rescheduling taskId=${handle.taskId}, " +
+        "Rescheduling taskId=$taskId, " +
           "schedule=$schedule, conditions=${conditions.size}"
       }
-      scheduler.cancel(handle.taskId)
-      if (state.isActive) {
-        coordinator.pause(handle.taskId)
+      // Finished even when the caller is cancelled while the task stops, like a pause.
+      withContext(NonCancellable) {
+        scheduler.cancel(taskId)
+        // Stopped also while it starts, shown queued as it looks its content up, as a magnet does,
+        // and again once out of the queue, which may have started it in between.
+        coordinator.pause(taskId)
+        queue.dequeue(taskId)
+        coordinator.pause(taskId)
+        scheduler.reschedule(handle, schedule, conditions)
       }
-      queue.dequeue(handle.taskId)
-      scheduler.reschedule(handle, schedule, conditions)
     }
   }
 
@@ -1097,6 +1127,19 @@ class Ketch(
     queue.updateLimits(config.maxConcurrentDownloads, config.maxConnectionsPerHost)
 
     log.i { "Config updated: $config" }
+  }
+
+  /**
+   * Refuses [DownloadRequest.selectedFileIds] that the request's [DownloadRequest.resolvedSource]
+   * does not list, such as a torrent's padding files, or any when it lists none, as an ordinary
+   * file has no files to choose; a request without one is checked as it starts.
+   */
+  private fun requireListedFiles(request: DownloadRequest) {
+    val resolved = request.resolvedSource ?: return
+    if (request.selectedFileIds.isEmpty()) return
+    val listed = resolved.files.mapTo(HashSet()) { it.id }
+    val unknown = request.selectedFileIds.filter { it !in listed }
+    require(unknown.isEmpty()) { unknownFilesMessage(unknown) }
   }
 
   /** Refuses a [proxy] other than the system's when the HTTP engine cannot apply it. */
