@@ -418,12 +418,15 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   range, a body of the wrong length or too long, a redirect it will not follow) or after 20
   redirects, nor with `logRequests = false`, nor for what an `onData` callback throws, which
   stays the `KetchError.Network`'s cause. A server certificate the platform refuses (expired, not
-  yet valid, revoked, for another host or not trusted: `certificateProblemOf`, from JSSE,
-  Conscrypt and OkHttp exceptions or `NSURLErrorServerCertificate` codes) fails a request with a
-  `KetchError.SourceError` saying which (`CertificateProblem.description`), not a `Network`
-  error, as retrying gets the same certificate. A GET that went to a remembered redirect target
-  whose certificate is refused follows the redirects again at once, as the origin may send it
-  elsewhere since, and fails only when that fails too
+  yet valid, revoked, for another host or not trusted: `certificateProblemOf`, from JSSE, Conscrypt
+  and OkHttp exceptions or `NSURLErrorServerCertificate` codes) fails a request with a
+  `KetchError.SourceError` saying which (`CertificateProblem.description`), not a `Network` error,
+  as retrying gets the same certificate. A GET that went to a remembered redirect target whose
+  certificate is refused follows the redirects again at once, as the origin may send it elsewhere
+  since, and fails only when that fails too. A body it stops reading early (a pause, a lane taken
+  over, a failure) is cancelled where it reads it: `bodyAsChannel()` copies the response into a
+  channel in a coroutine of the client's job, which Ktor's cleanup never cancels, so one waiting for
+  room would otherwise keep its buffered megabytes as long as the client lives
 - An HTTP download without `Content-Disposition` is named after the URL that answered
   (`ServerInfo.url`, after redirects) when that name has an extension, as browsers do (a
   `/download?id=5` link redirecting to `app.dmg`), else after the requested URL when its name
