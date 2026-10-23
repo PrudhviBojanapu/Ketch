@@ -8,8 +8,12 @@ import com.linroid.ketch.core.file.sanitizeFileName
  * [diskComponent].
  */
 internal fun validateTorrentComponent(value: String) {
-  require(value.isNotEmpty() && value != "." && value != "..") { "Unsafe torrent path" }
-  require(value.none { it < ' ' || it == '/' || it == '\\' }) { "Unsafe torrent path component" }
+  require(value.isNotEmpty() && value != "." && value != "..") {
+    "Unsafe torrent path: ${quotedName(value)}"
+  }
+  require(value.none { it < ' ' || it == '/' || it == '\\' }) {
+    "Unsafe torrent path component: ${quotedName(value)}"
+  }
 }
 
 /**
@@ -47,3 +51,30 @@ internal fun diskComponent(value: String): String {
   check(isDiskComponent(cleaned)) { "Unsafe cleaned torrent path component" }
   return cleaned
 }
+
+
+/**
+ * [value], a name a torrent lists, quoted for an error message: control characters (C0 and C1)
+ * and Unicode `Bidi_Control` characters escaped as `\uXXXX`, so a name cannot rewrite what a
+ * terminal shows, and at most 80 characters.
+ */
+internal fun quotedName(value: String): String {
+  val shown = buildString {
+    for (char in value) {
+      if (length >= 80) {
+        append('…')
+        break
+      }
+      if (char.isISOControl() || char in BIDI_CONTROLS) {
+        append("\\u").append(char.code.toString(16).padStart(4, '0'))
+      } else {
+        append(char)
+      }
+    }
+  }
+  return "\"$shown\""
+}
+
+/** Unicode `Bidi_Control` characters, the set core's `sanitizeFileName` removes. */
+private const val BIDI_CONTROLS =
+  "\u061C\u200E\u200F\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069"
