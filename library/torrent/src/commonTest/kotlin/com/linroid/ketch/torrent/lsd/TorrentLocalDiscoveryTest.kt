@@ -278,6 +278,70 @@ class TorrentLocalDiscoveryTest {
   }
 
   @Test
+  fun accept_newPeer_isAnsweredAsSoonAsAMinuteAllows() = runTest {
+    val transport = FakeLsdTransport()
+    val service = service(transport)
+    join(service, mutableListOf(), hashA)
+    runCurrent()
+    assertEquals(1, transport.sent.value.size)
+
+    // Two minutes on, a device joins: it hears us at once, not at our next round.
+    advanceTimeBy(2 * TorrentLocalDiscovery.MIN_INTERVAL_MS)
+    transport.announceFrom("192.168.1.20", 7000, hashA)
+    runCurrent()
+    assertEquals(listOf(hashA, hashA), transport.announcedHashes())
+
+    // Within the minute, more peers wait for it; one answer goes out then.
+    advanceTimeBy(10_000)
+    transport.announceFrom("192.168.1.21", 7000, hashA)
+    transport.announceFrom("192.168.1.22", 7000, hashA)
+    runCurrent()
+    assertEquals(2, transport.sent.value.size)
+    advanceTimeBy(TorrentLocalDiscovery.MIN_INTERVAL_MS - 10_000)
+    runCurrent()
+    assertEquals(3, transport.sent.value.size)
+    advanceTimeBy(TorrentLocalDiscovery.MIN_INTERVAL_MS)
+    assertEquals(3, transport.sent.value.size)
+  }
+
+  @Test
+  fun accept_peersHeardEveryRound_neverAnswerEachOther() = runTest {
+    val transport = FakeLsdTransport()
+    val service = service(transport)
+    join(service, mutableListOf(), hashA)
+    runCurrent()
+    advanceTimeBy(2 * TorrentLocalDiscovery.MIN_INTERVAL_MS)
+    transport.announceFrom("192.168.1.20", 7000, hashA)
+    runCurrent()
+    assertEquals(2, transport.sent.value.size)
+
+    // Its answer to ours, a minute on, and its rounds after are no newcomer's announces.
+    advanceTimeBy(TorrentLocalDiscovery.MIN_INTERVAL_MS)
+    transport.announceFrom("192.168.1.20", 7000, hashA)
+    runCurrent()
+    assertEquals(2, transport.sent.value.size)
+    val round = TorrentLocalDiscovery.ANNOUNCE_INTERVAL_MS
+    advanceTimeBy(round - TorrentLocalDiscovery.MIN_INTERVAL_MS - 1)
+    transport.announceFrom("192.168.1.20", 7000, hashA)
+    runCurrent()
+    assertEquals(2, transport.sent.value.size)
+    advanceTimeBy(2)
+    assertEquals(3, transport.sent.value.size)
+  }
+
+  @Test
+  fun accept_peerOfAnotherTorrent_isNotAnswered() = runTest {
+    val transport = FakeLsdTransport()
+    val service = service(transport)
+    join(service, mutableListOf(), hashA)
+    runCurrent()
+    advanceTimeBy(2 * TorrentLocalDiscovery.MIN_INTERVAL_MS)
+    transport.announceFrom("192.168.1.20", 7000, hashB)
+    runCurrent()
+    assertEquals(1, transport.sent.value.size)
+  }
+
+  @Test
   fun accept_ignoresOwnCookieAndPublicSenders() = runTest {
     val transport = FakeLsdTransport()
     val service = service(transport)
