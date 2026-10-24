@@ -33,9 +33,11 @@ import kotlin.time.Duration
  * ```
  *
  * @param embeddedFactory creates the embedded device; `null` for remote-only mode.
+ * @param instanceId this device's identity.
  */
 class FakeInstanceFactory(
   embeddedFactory: (() -> KetchApi)? = { FakeKetchApi("Core") },
+  instanceId: String? = null,
 ) {
   /** Every remote client created, oldest first. */
   val remotes: MutableList<FakeRemote> = mutableListOf()
@@ -52,9 +54,13 @@ class FakeInstanceFactory(
   /** Speed modes new remote clients run; `null` for none, as an older Ketch. */
   var speedModes: FakeSpeedModes? = null
 
+  /** Identity new remote clients report in their status. */
+  var announcedInstanceId: String? = null
+
   /** The factory to build the manager with. */
   val factory: InstanceFactory = InstanceFactory(
     deviceName = "MacBook Pro",
+    instanceId = instanceId,
     embeddedFactory = embeddedFactory,
     remoteFactory = ::createRemote,
   )
@@ -63,7 +69,9 @@ class FakeInstanceFactory(
   fun clientsOf(deviceId: String): List<FakeRemote> = remotes.filter { it.deviceId == deviceId }
 
   private fun createRemote(config: RemoteConfig): RemoteInstance {
-    val client = FakeRemote(config, stateOnStart, announcedName, announcedOs, speedModes)
+    val client = FakeRemote(
+      config, stateOnStart, announcedName, announcedOs, speedModes, announcedInstanceId
+    )
     remotes += client
     return RemoteInstance(client, config, client.connection)
   }
@@ -82,6 +90,7 @@ class FakeRemote(
   private val announcedName: String,
   private val announcedOs: String,
   val speedModes: FakeSpeedModes? = null,
+  private val announcedInstanceId: String? = null,
 ) : KetchApi {
   override fun <T> subscribe(interest: Interest<T>, interval: Duration): Flow<T> =
     speedModes?.follow(interest) ?: emptyFlow()
@@ -131,6 +140,7 @@ class FakeRemote(
       usableSpace = 1_800_000_000_000,
     ),
     features = if (speedModes == null) emptySet() else setOf(KetchFeatures.SPEED_MODES),
+    instanceId = announcedInstanceId,
   )
 
   override suspend fun download(request: DownloadRequest): DownloadTask =

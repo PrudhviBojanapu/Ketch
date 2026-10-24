@@ -24,6 +24,8 @@ import com.linroid.ketch.app.platform.FolderBookmarks
 import com.linroid.ketch.app.platform.rememberFileActions
 import com.linroid.ketch.app.state.IncomingDownloads
 import com.linroid.ketch.app.state.rememberAppController
+import com.linroid.ketch.config.DEVICE_FILE_NAME
+import com.linroid.ketch.config.DeviceStore
 import com.linroid.ketch.config.FileConfigStore
 import com.linroid.ketch.config.KetchConfig
 import com.linroid.ketch.core.Ketch
@@ -121,6 +123,8 @@ private fun createInstanceManager(unreadableFiles: UnreadableFiles): InstanceMan
   val taskStore = createSqliteTaskStore(DriverFactory())
   val instanceName = config.name
     ?: UIDevice.currentDevice.name
+  // Left out of backups, so a restored iPhone gets an identity of its own.
+  val instanceId = DeviceStore("$supportDir/$DEVICE_FILE_NAME").instanceId()
   val torrentSource = TorrentDownloadSource(
     TorrentConfig(stateDirectory = "$supportDir/torrent-state")
       .withSettings(config.torrent.engineSettings),
@@ -130,6 +134,7 @@ private fun createInstanceManager(unreadableFiles: UnreadableFiles): InstanceMan
   return InstanceManager(
     factory = InstanceFactory(
       deviceName = instanceName,
+      instanceId = instanceId,
       embeddedFactory = {
         val httpEngine = KtorHttpEngine()
         Ketch(
@@ -143,6 +148,7 @@ private fun createInstanceManager(unreadableFiles: UnreadableFiles): InstanceMan
             HlsDownloadSource(httpEngine), DashDownloadSource(httpEngine),
             MetalinkDownloadSource(httpEngine), WebDavDownloadSource(httpEngine),
           ),
+          instanceId = instanceId,
           // Saved on the main thread, like the app's settings.
           speedModes = embeddedSpeedModes(config) { transform ->
             withContext(Dispatchers.Main) { saveConfig(configStore, transform) }

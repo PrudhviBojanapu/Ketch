@@ -19,6 +19,7 @@ import com.linroid.ketch.api.log.KetchLogger
 import com.linroid.ketch.api.log.LogLevel
 import com.linroid.ketch.api.log.Logger
 import com.linroid.ketch.config.CONFIG_DIR_ENV
+import com.linroid.ketch.config.DeviceStore
 import com.linroid.ketch.config.FileConfigStore
 import com.linroid.ketch.config.KetchConfig
 import com.linroid.ketch.config.PageAccessMode
@@ -28,6 +29,7 @@ import com.linroid.ketch.config.TorrentUploadMode
 import com.linroid.ketch.config.defaultConfigDir
 import com.linroid.ketch.config.defaultConfigPath
 import com.linroid.ketch.config.defaultDbPath
+import com.linroid.ketch.config.defaultDevicePath
 import com.linroid.ketch.config.generateConfig
 import com.linroid.ketch.core.Ketch
 import com.linroid.ketch.core.geo.DbIpCountryDatabase
@@ -512,6 +514,7 @@ private fun runServer(args: Array<String>): Int {
   val dbPath = defaultDbPath()
   val instance = claimDownloads(SERVER_COMMAND)
   val taskStore = openTaskStore(dbPath)
+  val instanceId = deviceInstanceId()
 
   val httpEngine = KtorHttpEngine.withNetworkInterfaces()
   val torrents = torrentSource(mergedConfig.torrent, listenPort = mergedConfig.torrent.listenPort)
@@ -527,6 +530,7 @@ private fun runServer(args: Array<String>): Int {
       MetalinkDownloadSource(httpEngine), WebDavDownloadSource(httpEngine),
     ),
     countries = DbIpCountryDatabase(File(defaultConfigDir(), COUNTRY_DATABASE_FILE)),
+    instanceId = instanceId,
     // Clients switch them; the server follows them while none is connected.
     speedModes = serverSpeedModes(
       file = settingsFile,
@@ -1112,6 +1116,7 @@ private fun runStandaloneMcp(
 
   val instance = claimDownloads(STANDALONE_MCP_COMMAND)
   val taskStore = openTaskStore(defaultDbPath())
+  val instanceId = deviceInstanceId()
 
   val httpEngine = KtorHttpEngine.withNetworkInterfaces()
   // It serves an agent while the client runs, so it does not share finished torrents again when
@@ -1127,6 +1132,7 @@ private fun runStandaloneMcp(
       HlsDownloadSource(httpEngine), DashDownloadSource(httpEngine),
       MetalinkDownloadSource(httpEngine), WebDavDownloadSource(httpEngine),
     ),
+    instanceId = instanceId,
   )
   val apiToken = newToken()
   val apiServer = KetchServer(
@@ -1298,6 +1304,17 @@ private fun readDefaultConfig(): KetchConfig {
     System.err.println("Ignoring $path, which can't be read: ${e.message}")
     KetchConfig.Unreadable
   }
+}
+
+/**
+ * This machine's instance id, from the `device.json` the desktop app, `ketch server` and
+ * `ketch mcp --standalone` share. Call it under the downloads lock ([claimDownloads]), so two
+ * processes never create the file at once.
+ */
+private fun deviceInstanceId(): String {
+  // The engine logs here too, once it is built; until then a replaced file's warning would be lost.
+  KetchLogger.setLogger(Logger.console(ketchLogLevel))
+  return DeviceStore(defaultDevicePath()).instanceId()
 }
 
 /**
