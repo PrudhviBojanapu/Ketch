@@ -623,6 +623,12 @@
   <string name="settings_speed_remote">Saved on %1$s until it restarts. No Slow lane or Auto for it yet.</string>
   <!-- On the page of a device that is not this one, %1$s, which keeps them when it restarts. -->
   <string name="settings_speed_remote_saved">Saved on %1$s. No Slow lane or Auto for it yet.</string>
+  <!-- On the page of a device that is not this one, %1$s, which runs its speed modes itself
+       and forgets its connection count when it restarts. -->
+  <string name="settings_speed_remote_modes">%1$s runs its speed mode and rules itself, even while this app is closed. Connections per download last until it restarts.</string>
+  <!-- On the page of a device that is not this one, %1$s, which runs its speed modes itself
+       and keeps every setting when it restarts. -->
+  <string name="settings_speed_remote_modes_saved">Saved on %1$s, which runs its speed mode and rules itself, even while this app is closed.</string>
   <!-- The group and row of a device without speed modes, which has one limit. -->
   <string name="settings_speed_limit_group">Limit</string>
   <string name="settings_speed_limit">Speed limit</string>
