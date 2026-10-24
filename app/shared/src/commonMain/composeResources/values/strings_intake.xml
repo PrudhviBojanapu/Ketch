@@ -146,6 +146,7 @@
   </plurals>
   <!-- Pills before a row's status line. -->
   <string name="intake_badge_duplicate">Already in Ketch</string>
+  <string name="intake_badge_same_name">Same name exists</string>
   <string name="intake_badge_no_resume">No resume</string>
   <!-- What the download already in Ketch is doing, after the "Already in Ketch" pill. %1$s is
        when it finished: "just now", "5 min ago", "yesterday" or a date such as "Sep 28". -->
@@ -216,6 +217,12 @@
   <string name="intake_rename">Rename</string>
   <string name="intake_keep_out">Keep out</string>
   <string name="intake_download_again">Download again</string>
+  <string name="intake_duplicate_add_numbered">Add (%1$s)</string>
+  <string name="intake_action_duplicate">Duplicate</string>
+  <string name="intake_duplicate_overwrite">Overwrite</string>
+  <string name="intake_status_overwrite">Will overwrite · %1$s</string>
+  <string name="intake_duplicate_dialog_title">File already exists</string>
+  <string name="intake_duplicate_dialog_message">A download named “%1$s” already exists. Choose how to proceed:</string>
   <string name="intake_add_all">Add all</string>
   <!-- %1$s is a file name or an option's value, such as "⚡ Urgent". -->
   <string name="intake_remove_named">Remove %1$s</string>

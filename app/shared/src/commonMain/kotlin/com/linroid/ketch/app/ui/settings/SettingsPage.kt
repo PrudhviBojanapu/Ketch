@@ -789,10 +789,6 @@ internal fun rememberSettingsSummaries(
       SettingsCategory.Integration,
       integrationSummary(integration, desktop, appSettings.clipboardMode),
     )
-    put(
-      SettingsCategory.Discover,
-      discoverSummary(aiSettings.settings, aiSettings.withPlatformCredentials(aiSettings.settings)),
-    )
     put(SettingsCategory.About, Res.string.settings_summary_version.text(KetchApi.VERSION))
     if (download != null) put(SettingsCategory.Downloads, downloadsSummary(download))
     val speed = when {

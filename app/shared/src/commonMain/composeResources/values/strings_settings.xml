@@ -1065,4 +1065,7 @@
   <string name="settings_auto_tomorrow_at">tomorrow %1$s</string>
   <!-- Follows "until" in the strings above. %1$s is a short weekday such as Fri, %2$s a time. -->
   <string name="settings_auto_day_at">%1$s %2$s</string>
+  <string name="settings_auto_open_title">Auto-open on completion</string>
+  <string name="settings_auto_open_desc">Automatically open downloaded files when they complete</string>
+  <string name="settings_auto_open_types">File types to open</string>
 </resources>

@@ -147,9 +147,10 @@ enum class SettingsCategory(
       val embedded = device is EmbeddedInstance
       return entries.filter { category ->
         when (category) {
-          Discover -> discoverSupported
+          Discover -> false
+          Integration -> false
+          Sharing -> false
           BitTorrent -> embedded
-          Sharing -> embedded && serverSupported
           else -> !category.page.isDevicePage || device != null
         }
       }

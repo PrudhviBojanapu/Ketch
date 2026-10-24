@@ -254,7 +254,7 @@ private fun deletionNote(plan: RemovalPlan, deviceName: UiText, freeBytes: Long?
  * Whether the files box of a dialog removing [plan] starts checked: only when there are files
  * and the dialog was opened to remove them too ([withFiles]), as ⇧⌫ does.
  */
-fun initiallyChecked(plan: RemovalPlan, withFiles: Boolean): Boolean = withFiles && plan.hasFiles
+fun initiallyChecked(plan: RemovalPlan, withFiles: Boolean): Boolean = plan.hasFiles
 
 /**
  * Asks before removing downloads, with a box that also moves their files to the Trash or, where

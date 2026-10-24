@@ -117,7 +117,6 @@ kotlin {
       implementation(projects.library.core)
     }
     jvmAndAndroidMain.dependencies {
-      implementation(projects.ai.discover)
     }
     androidMain.dependencies {
       implementation(libs.androidx.core)
@@ -125,7 +124,6 @@ kotlin {
       implementation(libs.androidx.activity.compose)
       implementation(projects.library.core)
       implementation(projects.library.ktor)
-      implementation(projects.library.ftp)
       implementation(projects.library.hls)
       implementation(projects.library.dash)
       implementation(projects.library.metalink)
@@ -137,7 +135,6 @@ kotlin {
     iosMain.dependencies {
       implementation(projects.library.core)
       implementation(projects.library.ktor)
-      implementation(projects.library.ftp)
       implementation(projects.library.hls)
       implementation(projects.library.dash)
       implementation(projects.library.metalink)
@@ -149,7 +146,6 @@ kotlin {
     jvmMain.dependencies {
       implementation(projects.library.core)
       implementation(projects.library.ktor)
-      implementation(projects.library.ftp)
       implementation(projects.library.hls)
       implementation(projects.library.dash)
       implementation(projects.library.metalink)
@@ -186,6 +182,7 @@ val aliasComposeResources = tasks.register<Sync>("aliasComposeResources") {
 }
 
 compose.resources {
+  packageOfResClass = "ketch.app.shared.generated.resources"
   customDirectory(
     sourceSetName = "commonMain",
     directoryProvider = aliasComposeResources.map { composeResourcesWithAliases.get() },

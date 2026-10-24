@@ -24,6 +24,7 @@ import ketch.app.shared.generated.resources.intake_age_just_now
 import ketch.app.shared.generated.resources.intake_age_minutes
 import ketch.app.shared.generated.resources.intake_age_yesterday
 import ketch.app.shared.generated.resources.intake_badge_duplicate
+import ketch.app.shared.generated.resources.intake_badge_same_name
 import ketch.app.shared.generated.resources.intake_badge_no_resume
 import ketch.app.shared.generated.resources.intake_duplicate_canceled
 import ketch.app.shared.generated.resources.intake_duplicate_downloading
@@ -35,6 +36,7 @@ import ketch.app.shared.generated.resources.intake_scheme_torrent
 import ketch.app.shared.generated.resources.intake_split
 import ketch.app.shared.generated.resources.intake_status_checking
 import ketch.app.shared.generated.resources.intake_status_downloads_again
+import ketch.app.shared.generated.resources.intake_status_overwrite
 import ketch.app.shared.generated.resources.intake_status_expands
 import ketch.app.shared.generated.resources.intake_status_expands_first
 import ketch.app.shared.generated.resources.intake_status_fetching
@@ -78,7 +80,11 @@ internal data class StatusLine(
 internal fun statusLine(entry: IntakeEntry, now: Instant): StatusLine {
   val duplicate = entry.duplicate
   if (duplicate != null && !entry.downloadAgain) {
-    val badge = Res.string.intake_badge_duplicate.text()
+    val badge = if (entry.duplicateIsNameConflict) {
+      Res.string.intake_badge_same_name.text()
+    } else {
+      Res.string.intake_badge_duplicate.text()
+    }
     return StatusLine(duplicateState(duplicate, now), LineTone.Warning, badge = badge)
   }
   val line = when (val status = entry.status) {
@@ -108,7 +114,11 @@ internal fun statusLine(entry: IntakeEntry, now: Instant): StatusLine {
     )
   }
   return if (duplicate != null) {
-    line.copy(text = Res.string.intake_status_downloads_again.text(line.text))
+    if (entry.overwrite) {
+      line.copy(text = Res.string.intake_status_overwrite.text(line.text))
+    } else {
+      line.copy(text = Res.string.intake_status_downloads_again.text(line.text))
+    }
   } else {
     line
   }

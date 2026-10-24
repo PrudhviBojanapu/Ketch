@@ -232,3 +232,33 @@ private const val HEX_UPPER = "0123456789ABCDEF"
 private const val PERCENT = '%'.code.toByte()
 private const val PLUS = '+'.code.toByte()
 private const val SPACE = ' '.code.toByte()
+
+/**
+ * Calculates the next available free numbered name (e.g. `file (1).ext`, `file (2).ext`)
+ * when [name] already exists in [existingNames].
+ */
+fun nextAvailableNumberedName(name: String, existingNames: Collection<String>): String {
+  val trimmed = name.trim()
+  if (trimmed.isEmpty()) return name
+  val dotIndex = trimmed.lastIndexOf('.')
+  val base = if (dotIndex > 0) trimmed.substring(0, dotIndex) else trimmed
+  val ext = if (dotIndex > 0) trimmed.substring(dotIndex) else ""
+  val cleanBase = base.replace(Regex("""\s*\(\d+\)$"""), "")
+  var index = 1
+  val lowerExisting = existingNames.map { it.lowercase() }.toSet()
+  while (true) {
+    val candidate = "$cleanBase ($index)$ext"
+    if (candidate.lowercase() !in lowerExisting) {
+      return candidate
+    }
+    index++
+  }
+}
+
+/** Sanitizes a file name by removing characters forbidden by Android/Windows filesystems. */
+fun sanitizeFileNameSafe(name: String): String {
+  val trimmed = name.trim()
+  if (trimmed.isEmpty()) return "download"
+  val safe = trimmed.replace(Regex("""[/\\:*?"<>|\u0000-\u001F\u007F]"""), "_").trim()
+  return safe.ifEmpty { "download" }
+}

@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Text
@@ -31,9 +32,11 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -83,17 +86,24 @@ import com.linroid.ketch.app.ui.FileDropTarget
 import com.linroid.ketch.app.ui.common.ModalForm
 import com.linroid.ketch.app.ui.common.modalForm
 import com.linroid.ketch.app.ui.downloads.ClipboardLink
+import com.linroid.ketch.app.util.displayName
+import com.linroid.ketch.app.util.nextAvailableNumberedName
 import com.linroid.ketch.app.util.toCopy
 import ketch.app.shared.generated.resources.Res
 import ketch.app.shared.generated.resources.action_cancel
 import ketch.app.shared.generated.resources.action_close
 import ketch.app.shared.generated.resources.action_done
 import ketch.app.shared.generated.resources.intake_action_add_anyway
+import ketch.app.shared.generated.resources.intake_action_duplicate
 import ketch.app.shared.generated.resources.intake_confirm_close
 import ketch.app.shared.generated.resources.intake_discard
 import ketch.app.shared.generated.resources.intake_discover
 import ketch.app.shared.generated.resources.intake_discover_offer
 import ketch.app.shared.generated.resources.intake_download_all
+import ketch.app.shared.generated.resources.intake_duplicate_add_numbered
+import ketch.app.shared.generated.resources.intake_duplicate_dialog_message
+import ketch.app.shared.generated.resources.intake_duplicate_dialog_title
+import ketch.app.shared.generated.resources.intake_duplicate_overwrite
 import ketch.app.shared.generated.resources.intake_keep_editing
 import ketch.app.shared.generated.resources.intake_no_links
 import ketch.app.shared.generated.resources.intake_task_gone
@@ -149,6 +159,9 @@ internal object IntakeSheetDefaults {
   /** Share of the window's height the sheet grows to. */
   const val MAX_HEIGHT_SHARE: Float = 0.8f
 
+  /** Share of the window's height the phone bottom sheet grows to. */
+  const val PHONE_MAX_HEIGHT_SHARE: Float = 0.68f
+
   /** Height of the phone sheet's main button. */
   val PhoneButtonHeight: Dp = 56.dp
 
@@ -198,6 +211,36 @@ internal class IntakeActions(
   /** Closes the sheet without asking. */
   fun discardAndClose() {
     onClose()
+  }
+
+  /** Resolves duplicate conflicts by numbering entries and submits. */
+  fun submitDuplicate() {
+    session.flush()
+    val existingNames = session.targetTasks.map { displayName(it.requestState.value, it.state.value) }
+    for (entry in session.entries) {
+      if (entry.duplicate != null && !entry.downloadAgain) {
+        val nextName = nextAvailableNumberedName(entry.name, existingNames)
+        entry.fileName = nextName
+        entry.downloadAgain = true
+        entry.overwrite = false
+      }
+    }
+    session.submit(onDone = onClose)
+  }
+
+  /** Resolves duplicate conflicts by overwriting existing tasks and submits. */
+  fun submitOverwrite() {
+    session.flush()
+    for (entry in session.entries) {
+      if (entry.duplicate != null && !entry.downloadAgain) {
+        entry.overwrite = true
+        entry.downloadAgain = true
+        if (entry.fileName.isEmpty()) {
+          entry.fileName = entry.name
+        }
+      }
+    }
+    session.submit(onDone = onClose)
   }
 
   /** Runs the main button. */
@@ -316,7 +359,7 @@ internal fun IntakeSheet(
       },
     )
   }
-  val available = if (phone) height else height * IntakeSheetDefaults.MAX_HEIGHT_SHARE
+  val available = height * (if (phone) IntakeSheetDefaults.PHONE_MAX_HEIGHT_SHARE else IntakeSheetDefaults.MAX_HEIGHT_SHARE)
   val listRows = ((available - IntakeSheetDefaults.FixedChrome) / IntakeSheetDefaults.RowHeight)
     .toInt()
     .coerceIn(IntakeSheetDefaults.MIN_ROWS, IntakeSheetDefaults.VISIBLE_ROWS)
@@ -409,8 +452,7 @@ private fun PhoneSheet(
     onDismissRequest = actions::discardAndClose,
     sheetState = rememberKetchSheetState(confirmChange),
   ) {
-    // Empty, the sheet is only as tall as its input; it takes the screen once links are in.
-    val full = session.showsOptions || session.confirmingClose
+    val maxHeight = windowHeight * IntakeSheetDefaults.PHONE_MAX_HEIGHT_SHARE
     IntakeContent(
       actions = actions,
       phone = true,
@@ -419,8 +461,7 @@ private fun PhoneSheet(
       dropping = false,
       modifier = Modifier
         .fillMaxWidth()
-        .heightIn(max = windowHeight)
-        .then(if (full) Modifier.fillMaxHeight() else Modifier)
+        .heightIn(max = maxHeight)
         .imePadding(),
     )
   }
@@ -689,19 +730,20 @@ private fun IntakeFooter(actions: IntakeActions, phone: Boolean, modifier: Modif
     horizontalArrangement = Arrangement.spacedBy(spacing.s2),
     modifier = modifier.fillMaxWidth(),
   ) {
+    val hasConflict = !batchStage && session.entries.any { it.duplicate != null && !it.downloadAgain }
     if (!phone) {
       Spacer(Modifier.weight(1f))
-      if (primaryShown && session.canSubmit && !batchStage) SubmitHint(session)
+      if (primaryShown && session.canSubmit && !batchStage && !hasConflict) SubmitHint(session)
     }
     val secondary: Pair<StringResource, () -> Unit>? = when {
+      hasConflict -> null
       batchStage -> null
       session.mode == IntakeMode.Add && session.allFailed ->
         Res.string.intake_action_add_anyway to actions::addAnyway
-      stageEntry != null && session.mode == IntakeMode.Add && !stageEntry.singleChoice ->
-        Res.string.intake_download_all to {
-          stageEntry.selectedFiles = stageEntry.files.mapTo(LinkedHashSet()) { it.id }
-          actions.submit()
-        }
+      stageEntry != null && session.mode == IntakeMode.Add && !stageEntry.singleChoice -> Res.string.intake_download_all to {
+        stageEntry.selectedFiles = stageEntry.files.mapTo(LinkedHashSet()) { it.id }
+        actions.submit()
+      }
       phone -> null
       else -> Res.string.action_cancel to actions::close
     }
@@ -715,7 +757,34 @@ private fun IntakeFooter(actions: IntakeActions, phone: Boolean, modifier: Modif
         else Modifier,
       )
     }
-    if (primaryShown || batchStage) {
+    if (hasConflict) {
+      KetchButton(
+        text = stringResource(Res.string.intake_action_duplicate),
+        onClick = actions::submitDuplicate,
+        variant = KetchButtonVariant.Secondary,
+        enabled = !session.submitting,
+        loading = session.submitting,
+        size = if (phone) KetchButtonSize.Large else KetchButtonSize.Medium,
+        modifier = if (phone) {
+          Modifier.weight(1f).heightIn(min = IntakeSheetDefaults.PhoneButtonHeight)
+        } else {
+          Modifier.widthIn(max = IntakeSheetDefaults.PrimaryMaxWidth)
+        },
+      )
+      KetchButton(
+        text = stringResource(Res.string.intake_duplicate_overwrite),
+        onClick = actions::submitOverwrite,
+        variant = KetchButtonVariant.Primary,
+        enabled = !session.submitting,
+        loading = session.submitting,
+        size = if (phone) KetchButtonSize.Large else KetchButtonSize.Medium,
+        modifier = if (phone) {
+          Modifier.weight(1f).heightIn(min = IntakeSheetDefaults.PhoneButtonHeight)
+        } else {
+          Modifier.widthIn(max = IntakeSheetDefaults.PrimaryMaxWidth)
+        },
+      )
+    } else if (primaryShown || batchStage) {
       KetchButton(
         text = if (batchStage) {
           stringResource(Res.string.action_done)

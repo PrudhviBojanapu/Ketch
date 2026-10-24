@@ -339,9 +339,10 @@ internal class RowCommands(
   }
 }
 
-/** Path of the file a completed row saved, or `null`. */
+/** Path of the file a completed row saved, or its target file if actively downloading. */
 internal val TaskRow.outputFile: String?
   get() = (state as? DownloadState.Completed)?.outputPath?.ifBlank { null }
+    ?: request.destination?.takeUnless(Destination::isName)?.value?.takeUnless { it.endsWith("/") }
 
 /** The web page [row]'s link was captured from; a `Referer` of another scheme is not opened. */
 private fun sourcePage(row: TaskRow): String? = row.request.referer?.takeIf { referer ->

@@ -12,7 +12,7 @@ plugins {
 }
 
 val conformancePins = Properties().apply {
-  rootProject.file("test-fixtures/torrent/clients.properties").inputStream().use { load(it) }
+  file("$projectDir/../../test-fixtures/torrent/clients.properties").inputStream().use { load(it) }
 }
 val libtorrentFixtureVersion = conformancePins.getProperty("libtorrent4j.version")
 val torrentConformance = providers.gradleProperty("torrentConformance")
@@ -63,7 +63,6 @@ kotlin {
       implementation(libs.jna)
     }
     jvmTest.dependencies {
-      implementation(projects.library.server)
       implementation(projects.library.remote)
       implementation(libs.ktor.client.cio)
       implementation("org.libtorrent4j:libtorrent4j:$libtorrentFixtureVersion")
@@ -71,7 +70,7 @@ kotlin {
       runtimeOnly("org.libtorrent4j:libtorrent4j-linux:$libtorrentFixtureVersion")
       runtimeOnly("org.libtorrent4j:libtorrent4j-windows:$libtorrentFixtureVersion")
     }
-    jvmTest.get().resources.srcDir(rootProject.file("test-fixtures/torrent"))
+    jvmTest.get().resources.srcDir(file("$projectDir/../../test-fixtures/torrent"))
     named("androidDeviceTest") {
       dependencies {
         implementation(libs.kotlin.test)

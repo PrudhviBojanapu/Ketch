@@ -232,8 +232,15 @@ class IntakeEntry internal constructor(source: IntakeSource) {
   var duplicate: DownloadTask? by mutableStateOf(null)
     internal set
 
+  /** Whether the conflict is caused by identical file name. */
+  var duplicateIsNameConflict: Boolean by mutableStateOf(false)
+    internal set
+
   /** Whether a [duplicate] is added again; duplicates stay out by default. */
   var downloadAgain: Boolean by mutableStateOf(false)
+
+  /** Whether this download should overwrite an existing file. */
+  var overwrite: Boolean by mutableStateOf(false)
 
   /** Whether the row is added despite a problem, or a torrent without its file list. */
   var addAnyway: Boolean by mutableStateOf(false)
@@ -1468,6 +1475,13 @@ class IntakeSession internal constructor(
       val results = supervisorScope {
         planned.map { (entry, request) ->
           async {
+            if (entry.overwrite) {
+              entry.duplicate?.let { oldTask ->
+                try {
+                  oldTask.remove(deleteFiles = false)
+                } catch (_: Exception) {}
+              }
+            }
             Triple(entry, request, catchingUnlessCancelled { target.instance.download(request) })
           }
         }.awaitAll()
@@ -1492,6 +1506,7 @@ class IntakeSession internal constructor(
       is IntakeSource.Link -> source.properties
       else -> emptyMap()
     }.let { if (TaskOrigin.PROPERTY in it) it else it + (TaskOrigin.PROPERTY to TaskOrigin.App.id) }
+      .let { if (entry.overwrite) it + ("ketch.overwrite" to "true") else it }
     val selection = entry.selectedFiles
     val variant = chosenVariant(entry)
     val selectedIds = when {
@@ -1507,6 +1522,7 @@ class IntakeSession internal constructor(
     val awaitsFiles = entry.addAnyway && !entry.allFiles && resolved?.files.isNullOrEmpty() &&
       KetchFeatures.AWAIT_FILE_SELECTION in targetFeatures()
     val name = entry.fileName.trim().ifEmpty { null }
+      ?: (if (entry.overwrite) entry.name.trim().ifEmpty { null } else null)
       ?: (entry.source as? IntakeSource.Link)?.fileName
     val urls = when (val source = entry.source) {
       is IntakeSource.Link -> listOf(source.url)
@@ -1920,12 +1936,30 @@ class IntakeSession internal constructor(
     for (entry in entries) entry.duplicate = duplicateOf(detector, entry)
   }
 
-  private fun duplicateOf(detector: DuplicateDetector<DownloadTask>, entry: IntakeEntry) =
-    when (val source = entry.source) {
+  private fun duplicateOf(detector: DuplicateDetector<DownloadTask>, entry: IntakeEntry): DownloadTask? {
+    val byUrl = when (val source = entry.source) {
       is IntakeSource.Link -> detector.find(source.url, entry.resolved)
       is IntakeSource.Range -> source.urls.firstNotNullOfOrNull { detector.find(it) }
       is IntakeSource.File -> entry.resolved?.let { detector.find(it.url, it) }
     }
+    if (byUrl != null) {
+      entry.duplicateIsNameConflict = false
+      return byUrl
+    }
+    val bound = task
+    val currentName = entry.name.trim()
+    if (currentName.isNotEmpty()) {
+      val byName = targetTasks.firstOrNull { t ->
+        t !== bound && displayName(t.requestState.value, t.state.value).equals(currentName, ignoreCase = true)
+      }
+      if (byName != null) {
+        entry.duplicateIsNameConflict = true
+        return byName
+      }
+    }
+    entry.duplicateIsNameConflict = false
+    return null
+  }
 
   private fun loadDefaults(target: InstanceEntry) {
     if (mode != IntakeMode.Add) return

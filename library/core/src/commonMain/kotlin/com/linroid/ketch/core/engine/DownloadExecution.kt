@@ -1148,8 +1148,13 @@ internal class DownloadExecution(
         IllegalArgumentException("File name \"$fileName\" leaves the folder $directory"),
       )
     }
-    val reserved = OutputPathReservations.reserveUnique(outputPath).also { reservedPaths += it }
-    return OutputTarget(reserved, partialOf(reserved), replace = false)
+    val overwrite = request.properties["ketch.overwrite"] == "true"
+    val reserved = if (overwrite) {
+      outputPath.also(::reserve)
+    } else {
+      OutputPathReservations.reserveUnique(outputPath).also { reservedPaths += it }
+    }
+    return OutputTarget(reserved, partialOf(reserved), replace = overwrite)
   }
 
   /**

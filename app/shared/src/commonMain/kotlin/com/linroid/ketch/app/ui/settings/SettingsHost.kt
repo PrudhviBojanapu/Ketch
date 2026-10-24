@@ -220,7 +220,7 @@ internal fun SettingsContent(
       )
     }
     val closeOrBack = {
-      if (!twoPane && pageName != null) pageName = null else onClose()
+      if (searching) query = "" else if (!twoPane && pageName != null) pageName = null else onClose()
     }
     if (!inWindow || !twoPane) {
       NavigationBackHandler(

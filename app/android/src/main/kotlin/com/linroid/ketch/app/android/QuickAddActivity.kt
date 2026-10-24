@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.os.IBinder
 import android.widget.Toast
@@ -32,6 +34,7 @@ import com.linroid.ketch.app.i18n.load
 import com.linroid.ketch.app.platform.SystemAppearance
 import com.linroid.ketch.app.platform.rememberReduceMotion
 import com.linroid.ketch.app.state.AppController
+import com.linroid.ketch.app.state.IntakeSeed
 import com.linroid.ketch.app.state.IncomingDownloads
 import com.linroid.ketch.app.state.LinkSource
 import com.linroid.ketch.app.state.LocalAppState
@@ -63,12 +66,35 @@ class QuickAddActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+    window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
     enableEdgeToEdge()
     // Once per share: a window recreated on rotation keeps the model and its sheet.
     if (!model.offered) {
       model.offered = true
       val incoming = model.incoming
-      val offered = sharedText(intent)?.let { incoming.offerText(it, LinkSource.Share) } == true
+      incoming.pendingLinks.value.forEach { incoming.complete(it) }
+      val cookies = intent?.getStringExtra("extra_cookies")?.takeIf { it.isNotBlank() }
+      val userAgent = intent?.getStringExtra("extra_user_agent")?.takeIf { it.isNotBlank() }
+      val referrer = intent?.getStringExtra("extra_referrer")?.takeIf { it.isNotBlank() }
+      val fileName = intent?.getStringExtra("extra_file_name")?.takeIf { it.isNotBlank() }
+      val url = intent?.getStringExtra("extra_url")?.takeIf { it.isNotBlank() } ?: sharedText(intent)
+
+      val offered = if (url != null && (cookies != null || userAgent != null || referrer != null || fileName != null)) {
+        val headers = mutableMapOf<String, String>()
+        cookies?.let { headers["Cookie"] = it }
+        userAgent?.let { headers["User-Agent"] = it }
+        referrer?.let { headers["Referer"] = it }
+        val seed = IntakeSeed(
+          url = url.trim(),
+          fileName = fileName,
+          headers = headers,
+        )
+        incoming.offerSeeds(listOf(seed), LinkSource.Share)
+        true
+      } else {
+        sharedText(intent)?.let { incoming.offerText(it, LinkSource.Share) } == true
+      }
       // A shared pairing link is confirmed in the app, which is where devices are managed.
       for (pairing in incoming.pendingPairings.value) {
         val open = Intent(Intent.ACTION_VIEW, pairing.link.toUri(), this, MainActivity::class.java)

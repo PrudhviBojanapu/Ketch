@@ -23,8 +23,7 @@ private val log = KetchLogger("WelcomeFlow")
 internal const val WELCOME_VERSION: Int = 1
 
 /** Whether the app greets the user with the [WelcomeFlow] on [platform] before anything else. */
-internal fun needsWelcome(platform: WelcomePlatform?, ui: UiPreferences): Boolean =
-  platform != null && ui.onboardingVersion < WELCOME_VERSION
+internal fun needsWelcome(platform: WelcomePlatform?, ui: UiPreferences): Boolean = false
 
 /** A screen of the [WelcomeFlow], in order. */
 internal enum class WelcomeStep {

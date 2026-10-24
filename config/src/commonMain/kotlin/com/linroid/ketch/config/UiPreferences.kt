@@ -134,6 +134,8 @@ data class UiPreferences(
   val settingsPage: String? = null,
   val discoverHistory: Boolean = true,
   val lastVersion: String? = null,
+  val autoOpenEnabled: Boolean = true,
+  val autoOpenExtensions: List<String> = listOf("apk"),
 ) {
   companion object {
     /** Docked inspector width until the user resizes it, in dp. */
