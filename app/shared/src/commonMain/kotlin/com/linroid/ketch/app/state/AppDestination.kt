@@ -59,6 +59,6 @@ enum class AppDestination(val label: UiText, val icon: KetchIcon, val command: K
      * @param discoverOffered whether AI discovery can run here and is switched on.
      */
     fun visible(discoverOffered: Boolean): List<AppDestination> =
-      entries.filter { it != Discover || discoverOffered }
+      listOf(Downloads)
   }
 }

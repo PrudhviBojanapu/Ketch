@@ -24,7 +24,7 @@ import okio.Path.Companion.toOkioPath
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 
-class KetchApplication : Application() {
+open class KetchApplication : Application() {
   init {
     // First, before content providers and any property here use kotlinx.coroutines: its shared
     // pool caps Dispatchers.IO at 16 threads rather than 64, and idle workers end after 10 s
@@ -95,12 +95,9 @@ class KetchApplication : Application() {
     // read now, meanwhile, the history is in memory by then.
     scope.launch { discoverHistory.load() }
     try {
-      startForegroundService(Intent(this, KetchService::class.java))
-    } catch (e: IllegalStateException) {
-      // Android 12+ throws ForegroundServiceStartNotAllowedException when the process starts in
-      // the background, such as for another app opening a shared download. The activity
-      // creates the service when it opens.
-      fileLogger.w("[KetchApplication] Couldn't start the service: ${e.describeCauses()}")
+      startService(Intent(this, KetchService::class.java))
+    } catch (e: Exception) {
+      fileLogger.w("[KetchApplication] Couldn't start the service: ${e.message}")
     }
   }
 

@@ -102,8 +102,8 @@ internal fun PasteArea(
   val interactions = remember { MutableInteractionSource() }
   val hovered by interactions.collectIsHoveredAsState()
   LaunchedEffect(session) {
-    // On phones a prefilled sheet keeps the keyboard down, so its rows stay in view.
-    val focusInput = session.mode == IntakeMode.Add && (!phone || session.text.text.isEmpty())
+    // Keep keyboard down on mobile form factors or when text is already populated
+    val focusInput = session.mode == IntakeMode.Add && !isMobilePlatform && session.text.text.isEmpty()
     if (focusInput) catchingUnlessCancelled { focus.requestFocus() }
   }
   val empty = session.text.text.isEmpty()

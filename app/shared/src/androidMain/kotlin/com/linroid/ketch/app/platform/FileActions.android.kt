@@ -72,7 +72,7 @@ private class AndroidFileActions(private val context: Context) : FileActions {
  *
  * @throws FileActionException when the file is gone, is a folder, or cannot be handed out.
  */
-internal fun openFileIntent(context: Context, path: String): Intent {
+fun openFileIntent(context: Context, path: String): Intent {
   val file = DownloadFile.of(context, path)
   return Intent(Intent.ACTION_VIEW)
     .setDataAndType(file.uri, file.mimeType ?: "*/*")
@@ -112,11 +112,15 @@ private class DownloadFile(val uri: Uri, val name: String, val mimeType: String?
         return DownloadFile(uri, name, type)
       }
       val file = File(path)
-      if (!file.exists()) throw FileActionException("${file.name} was moved or deleted")
-      if (file.isDirectory) {
-        throw FileActionException("Open the files in ${file.name} from a file manager")
+      val actualFile = if (file.exists()) file else {
+        val partFile = File("$path.part")
+        if (partFile.exists()) partFile else file
       }
-      return DownloadFile(downloadUri(context, path), file.name, mimeTypeOf(file.name))
+      if (!actualFile.exists()) throw FileActionException("${file.name} download has not created file data yet")
+      if (actualFile.isDirectory) {
+        throw FileActionException("Open the files in ${actualFile.name} from a file manager")
+      }
+      return DownloadFile(downloadUri(context, actualFile.absolutePath), actualFile.name, mimeTypeOf(file.name) ?: mimeTypeOf(actualFile.name))
     }
   }
 }
@@ -141,6 +145,7 @@ private fun fileName(path: String): String {
 
 private fun mimeTypeOf(name: String): String? {
   val extension = name.substringAfterLast('.', "").lowercase()
+  if (extension == "apk") return "application/vnd.android.package-archive"
   if (extension.isEmpty()) return null
   return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
 }

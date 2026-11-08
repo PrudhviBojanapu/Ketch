@@ -334,66 +334,7 @@ internal val SettingsIndex: List<SettingsIndexEntry> = listOf(
     title = Res.string.settings_integration_quick_add,
     keywords = Res.string.settings_search_quick_add_keywords,
   ),
-  // Discover
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_discovery,
-    keywords = Res.string.settings_search_ai_keywords,
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_content_filter,
-    description = Res.string.settings_search_ai_content_filter.text(),
-    keywords = Res.string.settings_search_ai_content_filter_keywords,
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_access_mode,
-    description = Res.string.settings_search_ai_access.text(),
-    keywords = Res.string.settings_search_ai_access_keywords,
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_access_trusted,
-    description = Res.string.settings_search_ai_trusted.text(),
-    keywords = Res.string.settings_search_ai_trusted_keywords,
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_providers,
-    description = Res.string.settings_search_provider.text(),
-    keywords = Res.string.settings_search_provider_keywords,
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_api_key,
-    keywords = Res.string.settings_search_api_key_keywords,
-    anchors = listOf(Res.string.settings_ai_providers),
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_model,
-    keywords = Res.string.settings_search_model_keywords,
-    anchors = listOf(Res.string.settings_ai_providers),
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_endpoint,
-    keywords = Res.string.settings_search_endpoint_keywords,
-    anchors = listOf(Res.string.settings_ai_providers),
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_test,
-    keywords = Res.string.settings_search_test_keywords,
-    anchors = listOf(Res.string.settings_ai_providers),
-  ),
-  SettingsIndexEntry(
-    category = SettingsCategory.Discover,
-    title = Res.string.settings_ai_web_search,
-    description = Res.string.settings_search_web_search.text(),
-    keywords = Res.string.settings_search_web_search_keywords,
-  ),
+
   // About
   SettingsIndexEntry(
     category = SettingsCategory.About,

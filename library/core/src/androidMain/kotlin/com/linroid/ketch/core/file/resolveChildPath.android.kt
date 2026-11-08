@@ -21,6 +21,17 @@ internal actual fun resolveChildPath(
   if (':' !in directory) return (directory.toPath() / fileName).toString()
   val uri = Uri.parse(directory)
   if (uri.scheme == "content") {
+    // Attempt direct POSIX bypass for primary external storage (e.g. Download)
+    if (DocumentsContract.isTreeUri(uri)) {
+      val treeDocId = DocumentsContract.getTreeDocumentId(uri)
+      if (treeDocId.startsWith("primary:")) {
+        val relPath = treeDocId.removePrefix("primary:")
+        val posixDir = java.io.File(android.os.Environment.getExternalStorageDirectory(), relPath)
+        if (posixDir.exists() || posixDir.mkdirs()) {
+          return java.io.File(posixDir, fileName).absolutePath
+        }
+      }
+    }
     val docUri = DocumentsContract.createDocument(
       AndroidContext.get().contentResolver,
       parentDocument(uri),

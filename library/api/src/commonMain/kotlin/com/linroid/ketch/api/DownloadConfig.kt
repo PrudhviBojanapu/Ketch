@@ -47,9 +47,9 @@ data class DownloadConfig(
   val saveIntervalMs: Long = 5_000,
   val bufferSize: Int = 8 * 1024,
   val speedLimit: SpeedLimit = SpeedLimit.Unlimited,
-  val maxConcurrentDownloads: Int = 4,
-  val maxConnectionsPerDownload: Int = 4,
-  val maxConnectionsPerHost: Int = 16,
+  val maxConcurrentDownloads: Int = 0,
+  val maxConnectionsPerDownload: Int = 32,
+  val maxConnectionsPerHost: Int = 64,
   val proxy: Proxy = Proxy.System,
   val categories: List<DownloadCategory> = emptyList(),
 ) {

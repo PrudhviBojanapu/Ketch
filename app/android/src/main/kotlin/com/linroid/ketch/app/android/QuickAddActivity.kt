@@ -101,15 +101,20 @@ class QuickAddActivity : ComponentActivity() {
 
   /**
    * The link a browser's "Download file with" chooser handed over: an `http(s)` link viewed
-   * with the file's type (`null` for links of other schemes, which the main activity opens).
+   * with the file's type (`null` for links of a web page), without query or fragment.
    */
-  private fun viewedLink(intent: Intent): String? = intent.data
-    ?.takeIf { it.scheme?.lowercase() in setOf("http", "https") }
-    ?.toString()
+  private fun viewedLink(intent: Intent?): String? {
+    if (intent?.action != Intent.ACTION_VIEW) return null
+    val uri = intent.data ?: return null
+    val scheme = uri.scheme
+    if (scheme != "http" && scheme != "https") return null
+    if (intent.type == null) return null
+    return uri.buildUpon().clearQuery().fragment(null).build().toString()
+  }
 }
 
 /**
- * The add sheet alone, in the app's theme, for the links [controller] was handed. Calls
+ * Draws the add sheet alone, in the app's theme, for the links [controller] was handed. Calls
  * [onClosed] once the sheet has opened and closed again.
  */
 @Composable

@@ -53,7 +53,11 @@ sealed interface IncomingDownload {
    * @property urls the links, in the order they arrived.
    * @property source how they reached the app.
    */
-  data class Links(val urls: List<String>, val source: LinkSource) : IncomingDownload {
+  data class Links(
+    val urls: List<String>,
+    val source: LinkSource,
+    val seeds: List<IntakeSeed> = emptyList(),
+  ) : IncomingDownload {
     override val label: String
       get() = urls.singleOrNull() ?: "${urls.size} links"
   }
@@ -165,6 +169,18 @@ class IncomingDownloads {
   fun offerLinks(urls: List<String>, source: LinkSource) {
     val links = urls.map { it.trim() }.filter { it.isNotEmpty() }
     if (links.isNotEmpty()) offer(IncomingDownload.Links(links, source))
+  }
+
+  /** Offers [seeds] with metadata (such as headers and filename); blank ones are dropped. */
+  fun offerSeeds(seeds: List<IntakeSeed>, source: LinkSource = LinkSource.Share) {
+    val validSeeds = seeds.filter { it.url.isNotBlank() }
+    if (validSeeds.isNotEmpty()) {
+      offer(IncomingDownload.Links(
+        urls = validSeeds.map { it.url.trim() },
+        source = source,
+        seeds = validSeeds,
+      ))
+    }
   }
 
   /**

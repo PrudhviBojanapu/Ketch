@@ -187,7 +187,18 @@ class DisplayNameTest {
     assertEquals("a b", percentDecode("a+b", plusAsSpace = true))
   }
 
+  @Test
+  fun nextAvailableNumberedName_incrementsCorrectly() {
+    val existing = listOf("file.apk", "file (1).apk", "other.zip")
+    assertEquals("file (2).apk", nextAvailableNumberedName("file.apk", existing))
+    assertEquals("file (2).apk", nextAvailableNumberedName("file (1).apk", existing))
+    assertEquals("other (1).zip", nextAvailableNumberedName("other.zip", existing))
+    assertEquals("new (1).txt", nextAvailableNumberedName("new.txt", listOf("new.txt")))
+    assertEquals("app (1)", nextAvailableNumberedName("app", listOf("app")))
+  }
+
   private companion object {
     const val HEX_HASH = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a"
   }
 }
+

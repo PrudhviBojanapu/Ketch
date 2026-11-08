@@ -172,12 +172,33 @@ private fun ShellContent(appState: AppState, openSettingsRequests: Flow<Unit>) {
   }
   ShellRequests(appState, shell, openSettingsRequests)
   val backLeadsHome = isMobilePlatform || layout.navigation == ShellNavigation.Phone
-  if (backLeadsHome && shell.destination != AppDestination.Downloads && !shell.settingsOpen) {
-    // Back leads home to Downloads; Settings and the phone's search handle it first.
-    NavigationBackHandler(
-      state = rememberNavigationEventState(NavigationEventInfo.None),
-      onBackCompleted = { shell.show(AppDestination.Downloads) },
-    )
+  if (backLeadsHome && !shell.settingsOpen) {
+    if (shell.pulseSheetOpen) {
+      NavigationBackHandler(
+        state = rememberNavigationEventState(NavigationEventInfo.None),
+        onBackCompleted = { shell.pulseSheetOpen = false },
+      )
+    } else if (appState.inspectedTask != null) {
+      NavigationBackHandler(
+        state = rememberNavigationEventState(NavigationEventInfo.None),
+        onBackCompleted = { appState.closeInspector() },
+      )
+    } else if (appState.selectedKeys.isNotEmpty()) {
+      NavigationBackHandler(
+        state = rememberNavigationEventState(NavigationEventInfo.None),
+        onBackCompleted = { appState.selectedKeys = emptySet() },
+      )
+    } else if (appState.statusFilter != StatusFilter.All) {
+      NavigationBackHandler(
+        state = rememberNavigationEventState(NavigationEventInfo.None),
+        onBackCompleted = { appState.statusFilter = StatusFilter.All },
+      )
+    } else if (shell.destination != AppDestination.Downloads) {
+      NavigationBackHandler(
+        state = rememberNavigationEventState(NavigationEventInfo.None),
+        onBackCompleted = { shell.show(AppDestination.Downloads) },
+      )
+    }
   }
   LaunchedEffect(windowInfo, appState) {
     // The device may have changed its settings while the app was in the background.

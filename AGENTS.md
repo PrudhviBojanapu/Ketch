@@ -1870,8 +1870,7 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   sheet, the palette and the Discover page match their own with a `ShortcutMatcher`. `⌘K`
   opens the command palette and `⌘/` the shortcut sheet, grouped by scope (Discover's only where
   Discover is offered). Commands the window's shell must run from outside it, such as the macOS
-  menu bar's, go through `AppState.runInShell`. A command's `alternates` are desktop chords that
-  run it too (`boundChords`) but that menus, tooltips and the sheet leave out, as Zoom in's `⌘+`
+  menu bar's, go through `AppState.runInShell`
 - Toasts and banners go through `MessageCenter`; removals and other undoable operations wait in
   `PendingOps` for their Undo window. A message posted with `notify = true` (Discover's page
   access questions) also becomes a system notification, once, while the app is not in front or
@@ -2022,30 +2021,15 @@ docker/       # Docker image of `ketch server` (Dockerfile, entrypoint, compose 
   progress). The tray icon (`TrayIcon.kt`) is an AWT `TrayIcon` of its own rather than
   Compose's `Tray`, which squeezes every image into a square: its sail fills from the foot as
   downloads progress, the macOS menu bar shows the speed after it (`[desktop] menuBarSpeed`)
-  and Windows paints it in the app icon's gradient. Its menu is the system's on macOS (an AWT
-  `PopupMenu`, which macOS draws as an `NSMenu`) and Java's on Linux, where fontconfig maps
-  Java's sans-serif to the system's; on Windows, whose Java menus only take Java's own fonts
-  (Arial and SimSun on Chinese Windows), Ketch draws it (`TrayMenu.kt`): a right click
-  (`TrayIconMenu.Drawn`) opens `TrayMenuWindow`, an undecorated, transparent, always-on-top
-  `UTILITY` window covering the work area of the pointer's screen (`systemScreens`,
-  `workAreaAt`: bounds without `Toolkit.getScreenInsets`), as large so its submenus open as
-  in-canvas popups (`compose.layers.type` is per process). It shows the same `MenuEntry` model
-  (`menuEntries`) as a `KetchContextMenu` at the pointer, in the app's theme and zoom, and
-  closes on a choice, Esc, a click outside or the window losing the focus
+  and Windows paints it in the app icon's gradient
 - Zoom (desktop, `zoomSupported`): Settings → General → Zoom (90 % to 200 %, `[appearance]
   zoom`) passes `AppSettingsController.zoomScale` to `KetchTheme(zoom)`, which multiplies the
   `LocalDensity` of every Ketch window (main, Settings, the close dialog), so text, icons and
   controls all grow and layouts pick their tier from the zoomed width; `WindowChrome.zoomed`
-  keeps the macOS traffic lights clear. Window sizes stay as they are. The tray menu follows it
-  too: Windows' as a Ketch window, Linux's, which Java draws, through `trayMenuFont(zoom)`, 12 px
-  at 100 %. Phones follow the system's display and text size and browsers zoom the web app, so
-  neither offers it. Zoom in (`⌘=`, and as alternates `⇧⌘=`, the `+` key of
-  other layouts and the keypad's) and Zoom out (`⌘−`, the keypad's) step through `ZoomLevels`,
-  the levels Settings offers, from a zoom between them too, and stop at the ends
-  (`AppSettingsController.zoomIn`/`zoomOut`); Actual size (`resetZoom`) has no chord, as `⌘0`
-  shows Devices. The main and Settings windows run the chords before their content
-  (`windowCommands`, `settingsCommands`); on macOS both windows' View menus list the three and own
-  `⌘=` and `⌘−`, which the windows leave to them (`menuKeys`). The palette lists them too
+  keeps the macOS traffic lights clear. Window sizes stay as they are. The tray menu, which Java
+  draws on Windows and Linux in its own sans-serif font only, takes `trayMenuFont(zoom)`, 12 px
+  at 100 % like Windows' menus. Phones follow the system's display and text size and browsers
+  zoom the web app, so neither offers it
 - Release notes (desktop, direct Android): What's new on the update toasts, and Settings → About,
   opens `ReleaseNotesDialog` (`ui/settings`; `AppState.releaseNotesRequest` for the toasts),
   which reads `AppUpdates.releaseNotes(version, since)`: the GitHub releases after `since`

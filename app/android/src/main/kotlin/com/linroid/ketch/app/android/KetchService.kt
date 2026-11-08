@@ -55,11 +55,8 @@ import com.linroid.ketch.core.geo.DbIpCountryDatabase
 import com.linroid.ketch.dash.DashDownloadSource
 import com.linroid.ketch.engine.KtorHttpEngine
 import com.linroid.ketch.engine.withNetworkInterfaces
-import com.linroid.ketch.ftp.FtpDownloadSource
-import com.linroid.ketch.hls.HlsDownloadSource
 import com.linroid.ketch.metalink.MetalinkDownloadSource
-import com.linroid.ketch.server.KetchServer
-import com.linroid.ketch.server.systemProtectedDirectories
+import com.linroid.ketch.hls.HlsDownloadSource
 import com.linroid.ketch.sqlite.DriverFactory
 import com.linroid.ketch.sqlite.createSqliteTaskStore
 import com.linroid.ketch.torrent.TorrentConfig
@@ -114,8 +111,7 @@ class KetchService : Service() {
     private set
 
   /** Builds discovery providers from the settings the user saves. */
-  val aiProviderFactory: AiDiscoveryProviderFactory =
-    EmbeddedAiDiscoveryProviderFactory()
+  val aiProviderFactory: AiDiscoveryProviderFactory? = null
 
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
   private val binder = LocalBinder()
@@ -217,7 +213,7 @@ class KetchService : Service() {
               app.fileLogger
             ),
             additionalSources = listOf(
-              FtpDownloadSource(), torrentSource,
+              torrentSource,
               HlsDownloadSource(httpEngine), DashDownloadSource(httpEngine),
               MetalinkDownloadSource(httpEngine), WebDavDownloadSource(httpEngine),
             ),
@@ -229,43 +225,9 @@ class KetchService : Service() {
             },
           )
         },
-        localServerFactory = { context ->
-          // Reloaded here so a restart from Settings picks up the
-          // saved port, token and mDNS choice.
-          val saved = configStore.load()
-          val serverConfig = saved.server
-          log.i { "Starting local server on port ${serverConfig.port}" }
-          val server = KetchServer(
-            context.api,
-            host = serverConfig.host,
-            port = serverConfig.port,
-            apiToken = serverConfig.apiToken,
-            name = saved.name ?: instanceName,
-            // With a token, pages on any site, such as the web app, may call the API, as
-            // they still need the token. Without one, KetchServer refuses them.
-            corsAllowedHosts = serverConfig.corsAllowedHosts.ifEmpty {
-              if (serverConfig.apiToken == null) emptyList() else listOf("*")
-            },
-            allowedHosts = serverConfig.allowedHosts,
-            allowedDirectories = serverConfig.allowedDirectories,
-            // The app's own files: its settings, database and token.
-            protectedDirectories = systemProtectedDirectories() + dataDir.path,
-            mdnsEnabled = serverConfig.mdnsEnabled,
-            mdnsRegistrar = AndroidMdnsRegistrar(),
-            pairingApprover = { request, address ->
-              context.pairingRequests.ask(request.name, request.code, request.os, address)
-            },
-            pairingOpen = { context.pairingRequests.isOpen },
-            onConfigChanged = context.onConfigChanged,
-          )
-          server.start(wait = false)
-          log.i { "Local server started on port ${serverConfig.port}" }
+        localServerFactory = { _ ->
           object : LocalServerHandle {
-            override fun stop() {
-              log.i { "Stopping local server" }
-              server.stop()
-              log.i { "Local server stopped" }
-            }
+            override fun stop() {}
           }
         },
         applyTorrentSettings = { torrentSource.applySettings(it.engineSettings) },
@@ -389,6 +351,9 @@ class KetchService : Service() {
 
   override fun onDestroy() {
     super.onDestroy()
+    kotlinx.coroutines.runBlocking {
+      com.linroid.ketch.app.android.root.RootNetworkTuner.onDownloadStopped()
+    }
     instanceManager.close()
     scope.cancel()
   }
@@ -419,6 +384,7 @@ class KetchService : Service() {
       combine(statuses, speedMode.mode) { status, _ -> status }.collectLatest { status ->
         latestStatus = status
         if (!status.isRequired) {
+          com.linroid.ketch.app.android.root.RootNetworkTuner.onDownloadStopped()
           if (isForeground) {
             log.i { "Leaving the foreground" }
             leaveForeground()
@@ -433,6 +399,11 @@ class KetchService : Service() {
           enterForeground(ongoing(status))
         }
         keepStarted()
+        if (status.downloading > 0) {
+          com.linroid.ketch.app.android.root.RootNetworkTuner.onDownloadStarted()
+        } else {
+          com.linroid.ketch.app.android.root.RootNetworkTuner.onDownloadStopped()
+        }
         while (status.downloading > 0) {
           delay(ForegroundPolicy.samplePeriod)
           // The service can leave the foreground meanwhile, such as at its time limit; posting
@@ -440,6 +411,7 @@ class KetchService : Service() {
           if (!isForeground) break
           notifier.refreshOngoing(ongoing(status))
         }
+        com.linroid.ketch.app.android.root.RootNetworkTuner.onDownloadStopped()
       }
     }
   }
@@ -559,10 +531,10 @@ class KetchService : Service() {
         ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
       )
       isForeground = true
-    } catch (e: IllegalStateException) {
+    } catch (e: Throwable) {
       // Android 12+ refuses to start a foreground service while the app is in the background,
       // e.g. when a scheduled download starts after the service left the foreground.
-      log.w { "Could not enter the foreground: ${e.describeCauses()}" }
+      log.w { "Could not enter the foreground: ${e.message}" }
     }
   }
 

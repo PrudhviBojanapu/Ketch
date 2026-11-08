@@ -44,6 +44,10 @@ internal actual fun currentSystemInfo(directory: String?): SystemInfo {
 internal actual fun defaultDownloadDirectory(): String = downloadsFolder(AndroidContext.get())
 
 private fun downloadsFolder(context: Context): String {
+  val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+  if (publicDir != null && (publicDir.exists() || publicDir.mkdirs())) {
+    return publicDir.absolutePath
+  }
   val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
     ?: File(context.filesDir, "downloads")
   return dir.absolutePath

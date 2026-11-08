@@ -31,10 +31,14 @@ import com.linroid.ketch.api.log.describeCauses
 import com.linroid.ketch.app.components.KetchButton
 import com.linroid.ketch.app.components.KetchButtonSize
 import com.linroid.ketch.app.components.KetchButtonVariant
+import com.linroid.ketch.app.components.KetchCheckbox
 import com.linroid.ketch.app.components.KetchIconButton
 import com.linroid.ketch.app.i18n.resolve
 import com.linroid.ketch.app.i18n.spanText
 import com.linroid.ketch.app.i18n.text
+import ketch.app.shared.generated.resources.settings_auto_open_desc
+import ketch.app.shared.generated.resources.settings_auto_open_title
+import ketch.app.shared.generated.resources.settings_auto_open_types
 import com.linroid.ketch.app.icons.KetchIcon
 import com.linroid.ketch.app.icons.KetchIconImage
 import com.linroid.ketch.app.instance.EmbeddedInstance
@@ -81,6 +85,7 @@ import ketch.app.shared.generated.resources.settings_downloads_private_folder
 import ketch.app.shared.generated.resources.settings_downloads_queue
 import ketch.app.shared.generated.resources.settings_downloads_queue_footer
 import ketch.app.shared.generated.resources.settings_downloads_recent
+import ketch.app.shared.generated.resources.settings_downloads_remote
 import ketch.app.shared.generated.resources.settings_downloads_retries
 import ketch.app.shared.generated.resources.settings_downloads_retries_count
 import ketch.app.shared.generated.resources.settings_downloads_retries_fewer
@@ -116,19 +121,16 @@ private val log = KetchLogger("DownloadSettings")
 /**
  * Download settings of [device]: where downloads are saved, the folders the add sheet offers,
  * and the queue. Every change applies as soon as it is made; the embedded device also saves it
- * to `config.toml`, as does a remote one whose server saves changes, while an older one keeps
- * it until it restarts.
+ * to `config.toml`, while a remote one keeps it until it restarts.
  */
 @Composable
 fun DownloadSettings(state: AppState, device: InstanceEntry) {
   val controller = state.settingsFor(device)
   LaunchedEffect(controller) { controller.loadDownload() }
   val config = controller.download
-  val features by remember(state, device) { state.featuresFlow(device) }
-    .collectAsState(emptySet())
   if (controller.isRemote) {
     SettingsNotice(
-      text = stringResource(downloadsRemoteNotice(features), device.label),
+      text = stringResource(Res.string.settings_downloads_remote, device.label),
       tone = NoticeTone.Info,
     )
   }
@@ -156,6 +158,9 @@ fun DownloadSettings(state: AppState, device: InstanceEntry) {
   FolderGroup(device, config, onChange)
   CategoryGroup(device, { controller.download ?: config }, sortsIntoFolders, onChange)
   FolderShortcuts(state, device, config)
+  if (device is EmbeddedInstance) {
+    AutoOpenGroup(state)
+  }
   QueueGroup(config, dropsStalls, onChange)
 }
 
@@ -542,3 +547,58 @@ private const val UnlimitedRetries = -1
 
 /** Seconds the stalled connections stepper offers; 0 is off. */
 private val StallChoices = listOf(0, 15, 30, 60, 120, 300)
+
+/** Auto-opening files of selected extensions upon download completion. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AutoOpenGroup(state: AppState) {
+  val spacing = KetchTheme.spacing
+  val ui = state.appSettings.ui
+  val enabled = ui.autoOpenEnabled
+  val selectedExtensions = ui.autoOpenExtensions.toSet()
+
+  val availableExtensions = listOf("apk", "zip", "pdf", "mp4", "mp3")
+
+  SettingsGroup(
+    title = stringResource(Res.string.settings_auto_open_title),
+    footer = stringResource(Res.string.settings_auto_open_desc),
+  ) {
+    SettingsSwitchRow(
+      title = stringResource(Res.string.settings_auto_open_title),
+      description = stringResource(Res.string.settings_auto_open_desc),
+      checked = enabled,
+      onCheckedChange = { isChecked ->
+        state.appSettings.saveUi { it.copy(autoOpenEnabled = isChecked) }
+      },
+    )
+
+    if (enabled) {
+      SettingsRow(
+        title = stringResource(Res.string.settings_auto_open_types),
+      ) {
+        FlowRow(
+          horizontalArrangement = Arrangement.spacedBy(spacing.s4),
+          verticalArrangement = Arrangement.spacedBy(spacing.s2),
+          modifier = Modifier.fillMaxWidth().padding(top = spacing.s1),
+        ) {
+          availableExtensions.forEach { ext ->
+            val isChecked = ext in selectedExtensions
+            KetchCheckbox(
+              checked = isChecked,
+              onCheckedChange = { checked ->
+                val newExtensions = if (checked) {
+                  (selectedExtensions + ext).toList()
+                } else {
+                  (selectedExtensions - ext).toList()
+                }
+                state.appSettings.saveUi { it.copy(autoOpenExtensions = newExtensions) }
+              },
+              label = ext.uppercase(),
+            )
+          }
+        }
+      }
+    }
+  }
+}
+

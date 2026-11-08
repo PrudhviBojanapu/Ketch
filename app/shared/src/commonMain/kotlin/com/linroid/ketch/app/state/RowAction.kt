@@ -285,6 +285,7 @@ private fun waitingOrRunning(
   capabilities: RowCapabilities,
 ): TaskActions {
   val menu = controls + listOfNotNull(
+    RowAction.Open,
     RowAction.SpeedLimit,
     RowAction.Connections,
     RowAction.Priority,
@@ -295,7 +296,7 @@ private fun waitingOrRunning(
     RowAction.StopAndDiscard,
     RowAction.Remove
   )
-  return TaskActions(primary, listOfNotNull(primary), menu)
+  return TaskActions(primary, listOfNotNull(primary, RowAction.Open), menu)
 }
 
 private fun completed(
@@ -309,8 +310,6 @@ private fun completed(
   val menu = listOfNotNull(
     RowAction.Open.takeIf { canOpen },
     RowAction.ShowInFolder.takeIf { canOpen },
-    // Live seeding only: the intent of a task waiting to seed, such as for uploads to resume,
-    // comes with its torrent snapshot, which the inspector follows and rows do not.
     RowAction.StopSeeding.takeIf { seeding },
     RowAction.CopyLink,
     RowAction.CopyPath,

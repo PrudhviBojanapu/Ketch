@@ -33,8 +33,6 @@ class HostShortcutsTest {
       KetchCommands.CloseWindow,
       KetchCommands.Minimize,
       KetchCommands.Settings,
-      KetchCommands.ZoomIn,
-      KetchCommands.ZoomOut,
     )) {
       assertTrue(command in owned, "${command.id} belongs to the menu bar")
     }
@@ -58,13 +56,7 @@ class HostShortcutsTest {
 
   @Test
   fun hostShortcuts_windowsAndLinux_ownOnlyTheWindowsChords() {
-    val expected = setOf(
-      KetchCommands.Settings,
-      KetchCommands.ZoomIn,
-      KetchCommands.ZoomOut,
-      KetchCommands.CloseWindow,
-      KetchCommands.Quit,
-    )
+    val expected = setOf(KetchCommands.Settings, KetchCommands.CloseWindow, KetchCommands.Quit)
 
     assertEquals(expected, hostShortcuts(DesktopOs.WINDOWS, slowLane = true))
     assertEquals(expected, hostShortcuts(DesktopOs.LINUX, slowLane = true))

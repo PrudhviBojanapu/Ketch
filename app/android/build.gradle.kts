@@ -1,11 +1,13 @@
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
+val isStandalone = (rootProject.name != "MyAioApp")
+
 plugins {
-  alias(libs.plugins.androidApplication)
+  alias(libs.plugins.androidLibrary)
+  id("org.jetbrains.kotlin.android")
   alias(libs.plugins.composeCompiler)
 }
-
 
 kotlin {
   compilerOptions {
@@ -18,13 +20,12 @@ android {
   compileSdk = libs.versions.android.compileSdk.get().toInt()
 
   defaultConfig {
-    applicationId = "com.linroid.ketch.app"
     minSdk = libs.versions.android.minSdk.get().toInt()
-    targetSdk = libs.versions.android.targetSdk.get().toInt()
-    versionName = providers.gradleProperty("VERSION_NAME").get()
-    // A property rather than GITHUB_RUN_NUMBER, which changes on every CI run and so would
-    // keep any build from reusing its configuration cache. The release workflow passes it.
-    versionCode = providers.gradleProperty("versionCode").orElse("1").get().toInt()
+    val ketchVersionName = providers.gradleProperty("VERSION_NAME").orElse("0.7.2").get()
+    val ketchVersionCode = providers.gradleProperty("versionCode").orElse("1").get()
+    buildConfigField("String", "VERSION_NAME", "\"$ketchVersionName\"")
+    buildConfigField("int", "VERSION_CODE", ketchVersionCode)
+    buildConfigField("String", "APPLICATION_ID", "\"app.myaioapp\"")
   }
 
   flavorDimensions += "distribution"
@@ -54,7 +55,6 @@ android {
       }
     }
   }
-
   buildTypes {
     debug {
       signingConfigs.findByName("release")?.let {
@@ -63,14 +63,10 @@ android {
     }
     release {
       isMinifyEnabled = true
-      isShrinkResources = true
       proguardFiles(
         getDefaultProguardFile("proguard-android-optimize.txt"),
-        rootDir.resolve("app/proguard-rules.pro"),
+        projectDir.resolve("proguard-rules.pro"),
       )
-      signingConfigs.findByName("release")?.let {
-        signingConfig = it
-      }
     }
   }
 
@@ -82,13 +78,6 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
-  }
-
-  // Android 13+ lists the languages of res/values-* in Ketch's language setting. Each translation
-  // adds the app's own strings there, beside the shared UI's Compose resources; English, the
-  // unqualified values, is named in res/resources.properties.
-  androidResources {
-    generateLocaleConfig = true
   }
 
   packaging {
@@ -112,17 +101,7 @@ android {
   }
 }
 
-// Releases take the workflow's run number as their version code. A debug build signed with the
-// release key gets one above any of them unless -PversionCode names one, so it installs over a
-// release install; a release then needs the debug build uninstalled first.
-if (!providers.gradleProperty("versionCode").isPresent) {
-  androidComponents {
-    onVariants(selector().withBuildType("debug")) { variant ->
-      // Below Play's 2,100,000,000 limit, and far above any release's run number.
-      variant.outputs.forEach { it.versionCode.set(2_000_000_000) }
-    }
-  }
-}
+// Releases take the workflow's run number as their version code. In MyAioApp this is built as a library.
 
 // Koog, kotlinx-schema and Ktor's server depend on kotlin-reflect for features the app does not
 // use (reflective tool sets and schemas, loading server modules by name). Its R8 rules keep most
@@ -132,23 +111,18 @@ configurations.matching { it.name.endsWith("ReleaseRuntimeClasspath") }.configur
 }
 
 dependencies {
-  "directImplementation"(projects.updater)
   testImplementation(libs.kotlin.testJunit)
   testImplementation(libs.kotlinx.coroutines.test)
   implementation(projects.config)
   implementation(projects.app.shared)
-  implementation(projects.ai.discover)
   implementation(projects.library.core)
   implementation(projects.library.ktor)
-  implementation(projects.library.ftp)
   implementation(projects.library.hls)
   implementation(projects.library.dash)
   implementation(projects.library.metalink)
   implementation(projects.library.webdav)
   implementation(projects.library.torrent)
   implementation(projects.library.sqlite)
-  implementation(projects.library.server)
-  implementation(libs.dnssd)
   implementation(libs.androidx.activity.compose)
   debugImplementation(libs.compose.uiTooling)
 }
